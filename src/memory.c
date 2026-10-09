@@ -40,10 +40,28 @@ typedef struct MemNode {
   struct MemNode * next;
 } MemNode;
 
+typedef struct MemUndo {
+  int existed;
+  char * tenant;
+  size_t tenant_len;
+  char * key;
+  size_t key_len;
+  uint8_t * bytes;
+  size_t len;
+  struct MemUndo * next;
+} MemUndo;
+
 typedef struct MemBag {
   const GDEFSMEMORY_Allocator * alloc;
   MemNode * head;
+  int txn;
+  int puts_in_txn;
+  MemUndo * undo;
 } MemBag;
+
+/* When positive, the Nth put inside a transaction returns an I/O error
+ * before it changes anything. Tests set this. It is not a planted defect. */
+int gdefsmemory_plant_fail_put = 0;
 
 static int same(const char * a, size_t a_len, const char * b, size_t b_len) {
   return a_len == b_len && (a_len == 0 || memcmp(a, b, a_len) == 0);
@@ -74,12 +92,83 @@ static MemNode * find_node(MemBag * bag, const char * tenant, size_t tenant_len,
   return NULL;
 }
 
+static void free_undo(MemBag * bag) {
+  MemUndo * u = bag->undo;
+  while (u != NULL) {
+    MemUndo * next = u->next;
+    gcu_allocator_free(bag->alloc, u->tenant);
+    gcu_allocator_free(bag->alloc, u->key);
+    gcu_allocator_free(bag->alloc, u->bytes);
+    gcu_allocator_free(bag->alloc, u);
+    u = next;
+  }
+  bag->undo = NULL;
+}
+
+static void unlink_node(MemBag * bag, const char * tenant, size_t tenant_len,
+    const char * key, size_t key_len) {
+  MemNode ** pp;
+  for (pp = &bag->head; *pp != NULL; pp = &(*pp)->next) {
+    MemNode * n = *pp;
+    if (same(n->tenant, n->tenant_len, tenant, tenant_len) &&
+        same(n->key, n->key_len, key, key_len)) {
+      *pp = n->next;
+      gcu_allocator_free(bag->alloc, n->tenant);
+      gcu_allocator_free(bag->alloc, n->key);
+      gcu_allocator_free(bag->alloc, n->bytes);
+      gcu_allocator_free(bag->alloc, n);
+      return;
+    }
+  }
+}
+
+static GDEFSTOR_Result stash(MemBag * bag, MemNode * existing,
+    const char * tenant, size_t tenant_len, const char * key, size_t key_len) {
+  MemUndo * u;
+  if (!bag->txn) {
+    return GDEFSTOR_OK;
+  }
+  u = (MemUndo *)gcu_allocator_calloc(bag->alloc, 1, sizeof *u);
+  if (u == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  u->existed = existing != NULL;
+  u->tenant = dup_span(bag->alloc, tenant, tenant_len);
+  u->key = dup_span(bag->alloc, key, key_len);
+  if (u->tenant == NULL || u->key == NULL) {
+    gcu_allocator_free(bag->alloc, u->tenant);
+    gcu_allocator_free(bag->alloc, u->key);
+    gcu_allocator_free(bag->alloc, u);
+    return GDEFSTOR_ERR_OOM;
+  }
+  u->tenant_len = tenant_len;
+  u->key_len = key_len;
+  if (existing != NULL) {
+    u->bytes = (uint8_t *)gcu_allocator_malloc(bag->alloc,
+        existing->len == 0 ? 1 : existing->len);
+    if (u->bytes == NULL) {
+      gcu_allocator_free(bag->alloc, u->tenant);
+      gcu_allocator_free(bag->alloc, u->key);
+      gcu_allocator_free(bag->alloc, u);
+      return GDEFSTOR_ERR_OOM;
+    }
+    if (existing->len > 0) {
+      memcpy(u->bytes, existing->bytes, existing->len);
+    }
+    u->len = existing->len;
+  }
+  u->next = bag->undo;
+  bag->undo = u;
+  return GDEFSTOR_OK;
+}
+
 static void bag_destroy(void * ctx) {
   MemBag * bag = (MemBag *)ctx;
   MemNode * n;
   if (bag == NULL) {
     return;
   }
+  free_undo(bag);
   n = bag->head;
   while (n != NULL) {
     MemNode * next = n->next;
@@ -101,6 +190,12 @@ static GDEFSTOR_Result bag_put(void * ctx, const char * tenant, size_t tenant_le
       (bytes == NULL && len != 0)) {
     return GDEFSTOR_ERR_INVALID;
   }
+  if (bag->txn && gdefsmemory_plant_fail_put > 0) {
+    bag->puts_in_txn += 1;
+    if (bag->puts_in_txn >= gdefsmemory_plant_fail_put) {
+      return GDEFSTOR_ERR_IO;
+    }
+  }
   copy = (uint8_t *)gcu_allocator_malloc(bag->alloc, len == 0 ? 1 : len);
   if (copy == NULL) {
     return GDEFSTOR_ERR_OOM;
@@ -109,6 +204,10 @@ static GDEFSTOR_Result bag_put(void * ctx, const char * tenant, size_t tenant_le
     memcpy(copy, bytes, len);
   }
   n = find_node(bag, tenant, tenant_len, key, key_len);
+  if (stash(bag, n, tenant, tenant_len, key, key_len) != GDEFSTOR_OK) {
+    gcu_allocator_free(bag->alloc, copy);
+    return GDEFSTOR_ERR_OOM;
+  }
   if (n != NULL) {
     gcu_allocator_free(bag->alloc, n->bytes);
     n->bytes = copy;
@@ -268,6 +367,78 @@ static GDEFSMEMORY_Result from_port(GDEFSTOR_Result rc) {
   }
 }
 
+static GDEFSTOR_Result restore_undo(MemBag * bag, MemUndo * u) {
+  MemNode * n = find_node(bag, u->tenant, u->tenant_len, u->key, u->key_len);
+  uint8_t * copy;
+  if (!u->existed) {
+    unlink_node(bag, u->tenant, u->tenant_len, u->key, u->key_len);
+    return GDEFSTOR_OK;
+  }
+  if (n == NULL) {
+    return GDEFSTOR_OK;
+  }
+  copy = (uint8_t *)gcu_allocator_malloc(bag->alloc, u->len == 0 ? 1 : u->len);
+  if (copy == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  if (u->len > 0) {
+    memcpy(copy, u->bytes, u->len);
+  }
+  gcu_allocator_free(bag->alloc, n->bytes);
+  n->bytes = copy;
+  n->len = u->len;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result bag_begin(void * ctx, const char * tenant,
+    size_t tenant_len) {
+  MemBag * bag = (MemBag *)ctx;
+  if (bag == NULL || tenant == NULL || tenant_len == 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (bag->txn) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  bag->txn = 1;
+  bag->puts_in_txn = 0;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result bag_commit(void * ctx) {
+  MemBag * bag = (MemBag *)ctx;
+  if (bag == NULL || !bag->txn) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  free_undo(bag);
+  bag->txn = 0;
+  bag->puts_in_txn = 0;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result bag_abort(void * ctx) {
+  MemBag * bag = (MemBag *)ctx;
+  if (bag == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  while (bag->undo != NULL) {
+    MemUndo * u = bag->undo;
+    GDEFSTOR_Result rc;
+    bag->undo = u->next;
+    u->next = NULL;
+    rc = restore_undo(bag, u);
+    gcu_allocator_free(bag->alloc, u->tenant);
+    gcu_allocator_free(bag->alloc, u->key);
+    gcu_allocator_free(bag->alloc, u->bytes);
+    gcu_allocator_free(bag->alloc, u);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+  }
+  bag->txn = 0;
+  bag->puts_in_txn = 0;
+  return GDEFSTOR_OK;
+}
+
 GDEFSMEMORY_Result gdefsmemory_store_create(
     const GDEFSMEMORY_Allocator * allocator, const GDEFSTOR_Limits * limits,
     GDEFSTOR_Store ** out_store) {
@@ -293,6 +464,9 @@ GDEFSMEMORY_Result gdefsmemory_store_create(
   backend.get = bag_get;
   backend.remove = bag_remove;
   backend.list = bag_list;
+  backend.begin = bag_begin;
+  backend.commit = bag_commit;
+  backend.abort = bag_abort;
   rc = gdefstor_store_create(&backend, use, limits, out_store);
   if (rc != GDEFSTOR_OK) {
     bag_destroy(bag);

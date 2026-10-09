@@ -26,6 +26,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include <ghoti.io/cutil/fiber.h>
 #include <ghoti.io/defiant-storage/defiant-storage.h>
 #include <ghoti.io/defiant-storage-memory/defiant-storage-memory.h>
@@ -72,6 +74,69 @@ void ConformanceClose(GDEFSTOR_Store * store) {
 } /* extern "C" */
 
 #include "suite.inc"
+
+extern "C" int gdefsmemory_plant_fail_put;
+
+namespace {
+
+GDEFSTOR_Result put_title(GDEFSTOR_Store * store, const char * value) {
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Column column;
+  GDEFSTOR_Result rc = gdefstor_write_begin(store, "t", 1, NULL, &write);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  memset(&column, 0, sizeof column);
+  column.name = "title";
+  column.name_len = 5;
+  column.value = (const uint8_t *)value;
+  column.value_len = strlen(value);
+  rc = gdefstor_projection_put(write, "page", 4, "e1", 2, &column, 1);
+  if (rc != GDEFSTOR_OK) {
+    gdefstor_write_abort(write);
+    return rc;
+  }
+  return gdefstor_write_commit(write);
+}
+
+} /* namespace */
+
+TEST(Commit, FailedUpdateKeepsPreviousBytes) {
+  GDEFSTOR_Store * store = NULL;
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Column column;
+  GDEFSTOR_Projection * row = NULL;
+  GDEFSTOR_Column got;
+  const uint8_t blob[] = {9};
+  ASSERT_EQ(GDEFSMEMORY_OK, gdefsmemory_store_create(NULL, NULL, &store));
+  ASSERT_EQ(GDEFSTOR_OK, put_title(store, "Hello"));
+  gdefsmemory_plant_fail_put = 2;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t", 1, NULL, &write));
+  memset(&column, 0, sizeof column);
+  column.name = "title";
+  column.name_len = 5;
+  column.value = (const uint8_t *)"There";
+  column.value_len = 5;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_put(write, "page", 4, "e1", 2, &column, 1));
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_blob_put(write, "ab", 2, blob, sizeof blob));
+  EXPECT_EQ(GDEFSTOR_ERR_IO, gdefstor_write_commit(write));
+  gdefsmemory_plant_fail_put = 0;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_get(store, "t", 1, "page", 4, "e1", 2, &row));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_column(row, 0, &got));
+  ASSERT_EQ(got.value_len, 5u);
+  EXPECT_EQ(0, memcmp(got.value, "Hello", 5));
+  gdefstor_projection_free(row);
+  {
+    uint8_t * bytes = NULL;
+    size_t len = 0;
+    EXPECT_EQ(GDEFSTOR_ERR_INVALID,
+        gdefstor_blob_get(store, "t", 1, "ab", 2, &bytes, &len));
+  }
+  gdefstor_store_destroy(store);
+}
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
