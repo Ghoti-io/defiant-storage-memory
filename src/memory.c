@@ -264,14 +264,20 @@ static GDEFSTOR_Result bag_get(void * ctx, const char * tenant, size_t tenant_le
 static GDEFSTOR_Result bag_remove(void * ctx, const char * tenant,
     size_t tenant_len, const char * key, size_t key_len) {
   MemBag * bag = (MemBag *)ctx;
+  MemNode * n;
   MemNode ** pp;
   if (bag == NULL) {
     return GDEFSTOR_ERR_INVALID;
   }
+  n = find_node(bag, tenant, tenant_len, key, key_len);
+  if (n == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (stash(bag, n, tenant, tenant_len, key, key_len) != GDEFSTOR_OK) {
+    return GDEFSTOR_ERR_OOM;
+  }
   for (pp = &bag->head; *pp != NULL; pp = &(*pp)->next) {
-    MemNode * n = *pp;
-    if (same(n->tenant, n->tenant_len, tenant, tenant_len) &&
-        same(n->key, n->key_len, key, key_len)) {
+    if (*pp == n) {
       *pp = n->next;
       gcu_allocator_free(bag->alloc, n->tenant);
       gcu_allocator_free(bag->alloc, n->key);
@@ -280,7 +286,7 @@ static GDEFSTOR_Result bag_remove(void * ctx, const char * tenant,
       return GDEFSTOR_OK;
     }
   }
-  return GDEFSTOR_ERR_INVALID;
+  return GDEFSTOR_ERR_INTERNAL;
 }
 
 static GDEFSTOR_Result bag_list(void * ctx, const char * tenant,
@@ -375,6 +381,29 @@ static GDEFSTOR_Result restore_undo(MemBag * bag, MemUndo * u) {
     return GDEFSTOR_OK;
   }
   if (n == NULL) {
+    n = (MemNode *)gcu_allocator_calloc(bag->alloc, 1, sizeof *n);
+    if (n == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    n->tenant = dup_span(bag->alloc, u->tenant, u->tenant_len);
+    n->key = dup_span(bag->alloc, u->key, u->key_len);
+    n->bytes = (uint8_t *)gcu_allocator_malloc(bag->alloc,
+        u->len == 0 ? 1 : u->len);
+    if (n->tenant == NULL || n->key == NULL || n->bytes == NULL) {
+      gcu_allocator_free(bag->alloc, n->tenant);
+      gcu_allocator_free(bag->alloc, n->key);
+      gcu_allocator_free(bag->alloc, n->bytes);
+      gcu_allocator_free(bag->alloc, n);
+      return GDEFSTOR_ERR_OOM;
+    }
+    if (u->len > 0) {
+      memcpy(n->bytes, u->bytes, u->len);
+    }
+    n->tenant_len = u->tenant_len;
+    n->key_len = u->key_len;
+    n->len = u->len;
+    n->next = bag->head;
+    bag->head = n;
     return GDEFSTOR_OK;
   }
   copy = (uint8_t *)gcu_allocator_malloc(bag->alloc, u->len == 0 ? 1 : u->len);

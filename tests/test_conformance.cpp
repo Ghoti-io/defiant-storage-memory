@@ -138,6 +138,29 @@ TEST(Commit, FailedUpdateKeepsPreviousBytes) {
   gdefstor_store_destroy(store);
 }
 
+TEST(Commit, FailedDeleteKeepsRow) {
+  GDEFSTOR_Store * store = NULL;
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Projection * row = NULL;
+  GDEFSTOR_Column got;
+  const uint8_t blob[] = {9};
+  ASSERT_EQ(GDEFSMEMORY_OK, gdefsmemory_store_create(NULL, NULL, &store));
+  ASSERT_EQ(GDEFSTOR_OK, put_title(store, "Hello"));
+  gdefsmemory_plant_fail_put = 1;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t", 1, NULL, &write));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_delete(write, "page", 4, "e1", 2));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_blob_put(write, "ab", 2, blob, sizeof blob));
+  EXPECT_EQ(GDEFSTOR_ERR_IO, gdefstor_write_commit(write));
+  gdefsmemory_plant_fail_put = 0;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_get(store, "t", 1, "page", 4, "e1", 2, &row));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_projection_column(row, 0, &got));
+  ASSERT_EQ(got.value_len, 5u);
+  EXPECT_EQ(0, memcmp(got.value, "Hello", 5));
+  gdefstor_projection_free(row);
+  gdefstor_store_destroy(store);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
