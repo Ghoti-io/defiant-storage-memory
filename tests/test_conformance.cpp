@@ -165,3 +165,45 @@ int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+/* A query reads what is committed: a commit that failed and was undone is not
+ * in its answer, and the row it was going to replace still is. */
+TEST(Commit, FailedUpdateIsNotQueried) {
+  GDEFSTOR_Store * store = NULL;
+  GDEFSTOR_Write * write = NULL;
+  GDEFSTOR_Column column;
+  const uint8_t blob[] = {9};
+  ASSERT_EQ(GDEFSMEMORY_OK, gdefsmemory_store_create(NULL, NULL, &store));
+  ASSERT_EQ(GDEFSTOR_OK, put_title(store, "Hello"));
+  gdefsmemory_plant_fail_put = 2;
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_write_begin(store, "t", 1, NULL, &write));
+  memset(&column, 0, sizeof column);
+  column.name = "title";
+  column.name_len = 5;
+  column.value = (const uint8_t *)"There";
+  column.value_len = 5;
+  ASSERT_EQ(GDEFSTOR_OK,
+      gdefstor_projection_put(write, "page", 4, "e1", 2, &column, 1));
+  ASSERT_EQ(GDEFSTOR_OK, gdefstor_blob_put(write, "ab", 2, blob, sizeof blob));
+  EXPECT_EQ(GDEFSTOR_ERR_IO, gdefstor_write_commit(write));
+  gdefsmemory_plant_fail_put = 0;
+  for (const char * want : {"Hello", "There"}) {
+    GDEFSTOR_QueryText text;
+    text.bytes = (const uint8_t *)want;
+    text.len = strlen(want);
+    GDEFSTOR_QueryNode node;
+    memset(&node, 0, sizeof node);
+    node.op = GDEFSTOR_QUERY_EQ;
+    node.left.kind = GDEFSTOR_QUERY_COLUMN;
+    node.left.column = "title";
+    node.left.column_len = 5;
+    node.right.kind = GDEFSTOR_QUERY_CONST;
+    node.right.texts = &text;
+    node.right.text_count = 1;
+    uint64_t n = 9;
+    ASSERT_EQ(GDEFSTOR_OK,
+        gdefstor_projection_count(store, "t", 1, "page", 4, &node, &n));
+    EXPECT_EQ(strcmp(want, "Hello") == 0 ? 1u : 0u, n) << want;
+  }
+  gdefstor_store_destroy(store);
+}
