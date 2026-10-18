@@ -1513,6 +1513,22 @@ static void m_destroy(void * ctx) {
   gcu_allocator_free(m->alloc, m);
 }
 
+/* An indexed field's index: the memory backend keeps none apart from its
+ * rows (every query is the reference scan), so there is never one to build
+ * and every indexed field is ready the moment its declaration commits. */
+static GDEFSTOR_Result m_index_state(void * ctx, const char * tenant,
+    size_t tenant_len, const GDEFSTOR_Type * type, size_t field,
+    int * out_state) {
+  (void)tenant;
+  (void)tenant_len;
+  if (ctx == NULL || type == NULL || out_state == NULL ||
+      field >= gdefstor_type_field_count(type)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  *out_state = GDEFSTOR_INDEX_READY;
+  return GDEFSTOR_OK;
+}
+
 GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
     GDEFSTOR_ModelBackend * out) {
   MModel * m = (MModel *)gcu_allocator_calloc(alloc, 1, sizeof *m);
@@ -1541,5 +1557,7 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->query = m_query;
   out->rebuild = m_rebuild;
   out->dump = m_dump;
+  out->index_ctx = m;
+  out->index_state = m_index_state;
   return GDEFSTOR_OK;
 }
