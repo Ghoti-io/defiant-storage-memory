@@ -54,6 +54,8 @@ const char * gdefsmemory_result_string(GDEFSMEMORY_Result result) {
     return "Internal error";
   case GDEFSMEMORY_ERR_BUSY:
     return "Writer busy";
+  case GDEFSMEMORY_ERR_CONFLICT:
+    return "Revision conflict";
   case GDEFSMEMORY_RESULT_COUNT:
   default:
     return "Unknown error";

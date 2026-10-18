@@ -20,12 +20,13 @@
 
 /**
  * @file memory.h
- * @brief Open a port store whose bytes live in the process.
+ * @brief Open a port store whose rows live in the process.
  * @stability free
  *
  * The returned store is the port's. Close it with gdefstor_store_destroy().
  * Isolation, the writer queue and the formats stay in the port; this library
- * only keeps the committed bytes.
+ * only keeps the committed bytes and, for the entity port (model.h), the
+ * committed rows.
  */
 
 #ifndef GHOTI_IO_GDEFSMEMORY_MEMORY_H
@@ -41,7 +42,10 @@ extern "C" {
 #endif
 
 /**
- * @brief Open an in-memory store.
+ * @brief Open an in-memory store, with the entity port (model.h).
+ *
+ * Queries over entities are answered by the port's reference scan
+ * (gdefstor_model_scan()) over the current tables of the last commit.
  *
  * @param allocator NULL uses gdefsmemory_allocator_default().
  * @param limits NULL uses the port's defaults. Passed through to the port.

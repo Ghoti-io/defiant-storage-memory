@@ -14,10 +14,21 @@ scan is the reference answer every other backend is checked against, by the
 conformance suite below. Nothing is indexed; the cost is linear in the rows of
 the type.
 
+It also serves the port's entity API (`defiant-storage/model.h`): each
+entity keeps its truth (its row, states, revisions and every item version) and
+its current table beside it, and a write works on copies of the entities it
+touches, swapped in at commit, so a read keeps seeing the last commit while a
+write is open. Entity queries are answered by the port's reference engine,
+`gdefstor_model_scan()`, over the current tables.
+
 Depends on `defiant-storage` through pkg-config.
 
 ```bash
 make test PREFIX=/path/to/prefix
 ```
 
-Its tests compile the port's conformance driver, installed beside the port.
+Its tests compile the port's conformance suites, installed beside the port:
+the key/bytes suite and the entity suite (`model.inc`). `make test` also runs `check-model`, which plants the defects
+a backend can make on its own (a `valid_to` written twice, a revert that
+reopens old rows, a current table that drifts from the truth) and requires a
+named test to fail for each.

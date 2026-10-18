@@ -53,6 +53,7 @@ typedef enum GDEFSMEMORY_Result {
   GDEFSMEMORY_ERR_INVALID,     ///< A caller argument is wrong, or a missing row.
   GDEFSMEMORY_ERR_INTERNAL,    ///< A library invariant failed.
   GDEFSMEMORY_ERR_BUSY,        ///< The tenant's writer is busy and this is not a fiber.
+  GDEFSMEMORY_ERR_CONFLICT,    ///< A write named a base revision that is no longer the newest.
   GDEFSMEMORY_RESULT_COUNT     ///< Not a result. Closes the string table.
 } GDEFSMEMORY_Result;
 

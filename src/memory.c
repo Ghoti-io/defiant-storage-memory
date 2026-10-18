@@ -21,10 +21,12 @@
 /**
  * @file
  *
- * Committed bytes for one process. The port owns isolation; this list only
- * stores what a commit handed it.
+ * Committed bytes for one process, and the store that pairs them with the
+ * entity backend of model.c. The port owns isolation; this list only stores
+ * what a commit handed it.
  */
 
+#include "model_internal.h"
 #include <ghoti.io/defiant-storage-memory/defiant-storage-memory.h>
 #include <ghoti.io/cutil/allocator.h>
 #include <stdint.h>
@@ -367,6 +369,8 @@ static GDEFSMEMORY_Result from_port(GDEFSTOR_Result rc) {
     return GDEFSMEMORY_ERR_INTERNAL;
   case GDEFSTOR_ERR_BUSY:
     return GDEFSMEMORY_ERR_BUSY;
+  case GDEFSTOR_ERR_CONFLICT:
+    return GDEFSMEMORY_ERR_CONFLICT;
   case GDEFSTOR_RESULT_COUNT:
   default:
     return GDEFSMEMORY_ERR_INTERNAL;
@@ -474,6 +478,7 @@ GDEFSMEMORY_Result gdefsmemory_store_create(
   const GDEFSMEMORY_Allocator * use = gdefsmemory_allocator_default();
   MemBag * bag;
   GDEFSTOR_Backend backend;
+  GDEFSTOR_ModelBackend model;
   GDEFSTOR_Result rc;
   if (allocator != NULL) {
     use = allocator;
@@ -496,9 +501,15 @@ GDEFSMEMORY_Result gdefsmemory_store_create(
   backend.begin = bag_begin;
   backend.commit = bag_commit;
   backend.abort = bag_abort;
-  rc = gdefstor_store_create(&backend, use, limits, out_store);
+  rc = gdefsmemory_model_backend(use, &model);
   if (rc != GDEFSTOR_OK) {
     bag_destroy(bag);
+    return from_port(rc);
+  }
+  rc = gdefstor_store_create_model(&backend, &model, use, limits, out_store);
+  if (rc != GDEFSTOR_OK) {
+    bag_destroy(bag);
+    model.destroy(model.ctx);
   }
   return from_port(rc);
 }
