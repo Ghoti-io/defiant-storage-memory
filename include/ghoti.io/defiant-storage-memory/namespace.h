@@ -36,6 +36,8 @@
 #define gdefsmemory_allocator_default                                          \
   GHOTIIO_DEFSMEMORY(gdefsmemory_allocator_default)
 #define gdefsmemory_result_string GHOTIIO_DEFSMEMORY(gdefsmemory_result_string)
+#define gdefsmemory_keystore_create \
+  GHOTIIO_DEFSMEMORY(gdefsmemory_keystore_create)
 #define gdefsmemory_store_create GHOTIIO_DEFSMEMORY(gdefsmemory_store_create)
 
 /// @endcond

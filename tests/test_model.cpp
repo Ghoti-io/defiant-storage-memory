@@ -21,8 +21,8 @@
 /**
  * @file
  *
- * Runs the port's entity conformance suite (model.inc) against the memory
- * backend.
+ * Runs the port's entity conformance suite (model.inc) and key store suite
+ * (keystore.inc) against the memory backend.
  */
 
 #include <gtest/gtest.h>
@@ -53,7 +53,13 @@ extern "C" void ModelClose(GDEFSTOR_Store * store) {
   gdefstor_store_destroy(store);
 }
 
+GDEFSTOR_Result KeyStoreOpen(const GDEFSTOR_KeyCipher * cipher,
+    GDEFSTOR_KeyStore ** out) {
+  return to_port(gdefsmemory_keystore_create(nullptr, cipher, out));
+}
+
 #include "model.inc"
+#include "keystore.inc"
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
