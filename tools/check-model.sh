@@ -5,7 +5,8 @@
 # Show that each defect planted in the memory entity backend (src/model.c)
 # turns a named test of the port's entity conformance suite red. These are the
 # defects a backend can commit on its own, whatever the port computed: history
-# rewritten in place, and current tables that drift from the truth.
+# rewritten in place, current tables that drift from the truth, and records,
+# counters and outbox rows kept outside the rules of story S6a.
 #
 # Usage: check-model.sh <make> <build-dir> [make args]
 
@@ -81,5 +82,80 @@ plant current-diverges src/model.c testModel \
   '    if (c->group == 0) {
       cur_remove(m->alloc, e, c->group, c->item);
     }'
+
+# Records, counters and the outbox (story S6a) --------------------------------
+
+# A record replaced in place in the committed tenant instead of in the
+# transaction: written outside the write, it survives the abort.
+plant record-outside-transaction src/model.c testModel \
+  'ModelRecords.AnAbortedWriteLeavesNoRecord' \
+  '  /* Kept in the transaction until it commits (sys_apply). */
+  o = rput_find(x, r->ns, r->ns_len, r->key, r->key_len);' \
+  '  {
+    int here = 0;
+    size_t at = rec_lower(x->ten, r->ns, r->ns_len, r->key, r->key_len, &here);
+    if (here) {
+      gcu_allocator_free(m->alloc, x->ten->recs[at].bytes);
+      x->ten->recs[at].bytes = bytes;
+      x->ten->recs[at].len = r->len;
+      return GDEFSTOR_OK;
+    }
+  }
+  o = rput_find(x, r->ns, r->ns_len, r->key, r->key_len);'
+
+# The floor never read: the next value comes from the committed one alone,
+# so the value an aborted write took is handed out again.
+plant counter-reuses-aborted-value src/model.c testModel \
+  'ModelCounters.AnAbortedWritesValueIsSkippedNotReused' \
+  '  flv = fl != NULL ? fl->value : 0;' \
+  '  flv = 0;'
+
+# A claim that walks the stream from its newest row: out of order.
+plant claim-out-of-order src/model.c testModel \
+  'ModelOutbox.ThreeAppendsAreClaimedInSequence' \
+  '  for (i = 0; i < x->nob && taken < max; i++) {
+    MOb * o = &x->obs[i];' \
+  '  for (i = x->nob; i-- > 0 && taken < max;) {
+    MOb * o = &x->obs[i];'
+
+# A live lease not looked at: a second claimer takes the stream too.
+plant double-claim-under-live-lease src/model.c testModel \
+  'ModelOutbox.ASecondClaimerDuringALiveLeaseGetsNothing' \
+  '        o->until > now_ms) {
+      return GDEFSTOR_OK;' \
+  '        o->until > now_ms && 0) {
+      return GDEFSTOR_OK;'
+
+# A row that reaches the threshold dropped instead of parked.
+plant parked-row-deleted src/model.c testModel \
+  'ModelOutbox.AFailingRowIsParkedCountedNeverClaimedAndKept' \
+  '      o->parked = 1;
+      o->until = 0;' \
+  '      ob_free(m->alloc, o);
+      memmove(&x->obs[at], &x->obs[at + 1],
+          (x->nob - at - 1) * sizeof *x->obs);
+      x->nob -= 1;
+      *out_parked = 1;
+      return GDEFSTOR_OK;'
+
+# Records treated as derived: a rebuild deletes them.
+plant rebuild-clears-records src/model.c testModel \
+  'ModelSystem.RebuildLeavesRecordsCountersAndTheOutboxAlone' \
+  'static GDEFSTOR_Result m_rebuild(void * ctx, void * txn) {' \
+  'static GDEFSTOR_Result m_record_delete(void * ctx, void * txn, const char * ns,
+    size_t ns_len, const char * key, size_t key_len, int * out_deleted);
+
+static GDEFSTOR_Result m_rebuild(void * ctx, void * txn) {' \
+  '  /* Every row, through the transaction, from its truth alone. */' \
+  '  for (i = x->ten->nrec; i > 0; i--) {
+    int gone = 0;
+    GDEFSTOR_Result rc0 = m_record_delete(m, x, x->ten->recs[i - 1].ns,
+        x->ten->recs[i - 1].ns_len, x->ten->recs[i - 1].key,
+        x->ten->recs[i - 1].key_len, &gone);
+    if (rc0 != GDEFSTOR_OK) {
+      return rc0;
+    }
+  }
+  /* Every row, through the transaction, from its truth alone. */'
 
 plant_finish

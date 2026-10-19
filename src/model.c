@@ -431,9 +431,61 @@ typedef struct MDraft {
   size_t json_len;
 } MDraft;
 
+/* A record: committed (in the tenant, sorted by namespace then key), or a
+ * transaction's put or delete of one (dead), which commit applies. */
+typedef struct MRec {
+  char * ns;
+  size_t ns_len;
+  char * key;
+  size_t key_len;
+  uint8_t * bytes;
+  size_t len;
+  int dead;
+} MRec;
+
+/* A counter's value (committed, or a transaction's), or a counter's floor. */
+typedef struct MCnt {
+  int kind;
+  char * name;
+  size_t name_len;
+  uint64_t value;
+} MCnt;
+
+/* An outbox row. */
+typedef struct MOb {
+  char * stream;
+  size_t stream_len;
+  uint64_t seq;
+  char * pid;
+  size_t pid_len;
+  char * fmt;
+  size_t fmt_len;
+  uint8_t * payload;
+  size_t payload_len;
+  int64_t until;
+  uint32_t fails;
+  int parked;
+} MOb;
+
 typedef struct MTen {
   char * name;
   size_t name_len;
+  /* Records, counters and the outbox: truth, which rebuild never touches. */
+  MRec * recs; /* sorted by ns, then key */
+  size_t nrec;
+  size_t caprec;
+  MCnt * cnts; /* committed values */
+  size_t ncnt;
+  size_t capcnt;
+  /* The highest value each counter ever handed out, committed or not:
+   * written at once, never in a transaction, so an aborted write's value
+   * stays taken. */
+  MCnt * floors;
+  size_t nfloor;
+  size_t capfloor;
+  MOb * obs; /* sorted by stream, then sequence */
+  size_t nob;
+  size_t capob;
   MEnt ** ents; /* by row - 1 */
   size_t nent;
   size_t capent;
@@ -464,6 +516,16 @@ typedef struct MTxn {
   size_t capdraft;
   int drafts_copied;
   uint64_t seq;
+  MRec * rput; /* records put or deleted, one entry per key */
+  size_t nrput;
+  size_t caprput;
+  MCnt * cset; /* counters advanced */
+  size_t ncset;
+  size_t capcset;
+  MOb * obs; /* a copy of the outbox, once written */
+  size_t nob;
+  size_t capob;
+  int obs_copied;
   struct MTxn * next;
 } MTxn;
 
@@ -624,6 +686,47 @@ static GDEFSTOR_Result slots_build(const GDEFSMEMORY_Allocator * a, MTen * t) {
   return GDEFSTOR_OK;
 }
 
+/* ---- records, counters and outbox rows, owned ----------------------------- */
+
+static void rec_free(const GDEFSMEMORY_Allocator * a, MRec * r) {
+  gcu_allocator_free(a, r->ns);
+  gcu_allocator_free(a, r->key);
+  gcu_allocator_free(a, r->bytes);
+  memset(r, 0, sizeof *r);
+}
+
+static void recs_free(const GDEFSMEMORY_Allocator * a, MRec * v, size_t n) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    rec_free(a, &v[i]);
+  }
+  gcu_allocator_free(a, v);
+}
+
+static void cnts_free(const GDEFSMEMORY_Allocator * a, MCnt * v, size_t n) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    gcu_allocator_free(a, v[i].name);
+  }
+  gcu_allocator_free(a, v);
+}
+
+static void ob_free(const GDEFSMEMORY_Allocator * a, MOb * o) {
+  gcu_allocator_free(a, o->stream);
+  gcu_allocator_free(a, o->pid);
+  gcu_allocator_free(a, o->fmt);
+  gcu_allocator_free(a, o->payload);
+  memset(o, 0, sizeof *o);
+}
+
+static void obs_free(const GDEFSMEMORY_Allocator * a, MOb * v, size_t n) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    ob_free(a, &v[i]);
+  }
+  gcu_allocator_free(a, v);
+}
+
 /* ---- tenants and transactions -------------------------------------------- */
 
 static MTen * ten_find(MModel * m, const char * name, size_t len) {
@@ -644,6 +747,10 @@ static void ten_free(const GDEFSMEMORY_Allocator * a, MTen * t) {
   gcu_allocator_free(a, t->ents);
   types_free(a, t->types, t->ntype);
   drafts_free(a, t->drafts, t->ndraft);
+  recs_free(a, t->recs, t->nrec);
+  cnts_free(a, t->cnts, t->ncnt);
+  cnts_free(a, t->floors, t->nfloor);
+  obs_free(a, t->obs, t->nob);
   gcu_allocator_free(a, t->slots);
   gcu_allocator_free(a, t->name);
   gcu_allocator_free(a, t);
@@ -660,6 +767,11 @@ static void txn_free(const GDEFSMEMORY_Allocator * a, MTxn * x) {
   }
   if (x->drafts_copied) {
     drafts_free(a, x->drafts, x->ndraft);
+  }
+  recs_free(a, x->rput, x->nrput);
+  cnts_free(a, x->cset, x->ncset);
+  if (x->obs_copied) {
+    obs_free(a, x->obs, x->nob);
   }
   gcu_allocator_free(a, x);
 }
@@ -785,6 +897,8 @@ static GDEFSTOR_Result m_abort(void * ctx, void * txn) {
   return GDEFSTOR_OK;
 }
 
+static void sys_apply(const GDEFSMEMORY_Allocator * a, MTen * t, MTxn * x);
+
 static GDEFSTOR_Result m_commit(void * ctx, void * txn) {
   MModel * m = (MModel *)ctx;
   MTxn * x = (MTxn *)txn;
@@ -809,6 +923,32 @@ static GDEFSTOR_Result m_commit(void * ctx, void * txn) {
           GDEFSTOR_OK) {
     m_abort(ctx, txn);
     return GDEFSTOR_ERR_OOM;
+  }
+  /* Room for every record and counter the transaction adds, so that
+   * applying them below cannot fail either. */
+  if (t->nrec + x->nrput > t->caprec) {
+    size_t cap = t->nrec + x->nrput;
+    MRec * next = (MRec *)gcu_allocator_realloc(m->alloc, t->recs,
+        cap * sizeof *next);
+    if (next == NULL) {
+      gcu_allocator_free(m->alloc, slots);
+      m_abort(ctx, txn);
+      return GDEFSTOR_ERR_OOM;
+    }
+    t->recs = next;
+    t->caprec = cap;
+  }
+  if (t->ncnt + x->ncset > t->capcnt) {
+    size_t cap = t->ncnt + x->ncset;
+    MCnt * next = (MCnt *)gcu_allocator_realloc(m->alloc, t->cnts,
+        cap * sizeof *next);
+    if (next == NULL) {
+      gcu_allocator_free(m->alloc, slots);
+      m_abort(ctx, txn);
+      return GDEFSTOR_ERR_OOM;
+    }
+    t->cnts = next;
+    t->capcnt = cap;
   }
   if (t->nent + added > t->capent) {
     size_t cap = t->capent == 0 ? 16 : t->capent;
@@ -861,6 +1001,7 @@ static GDEFSTOR_Result m_commit(void * ctx, void * txn) {
   if (x->seq != 0) {
     t->commit_seq = x->seq;
   }
+  sys_apply(m->alloc, t, x);
   txn_unlink(m, x);
   txn_free(m->alloc, x);
   return GDEFSTOR_OK;
@@ -1539,6 +1680,9 @@ static GDEFSTOR_Result m_rebuild(void * ctx, void * txn) {
   return slots_build(m->alloc, x->ten);
 }
 
+static GDEFSTOR_Result sys_dump(const MTen * t,
+    const GDEFSTOR_ModelVisitor * v);
+
 static GDEFSTOR_Result m_dump(void * ctx, const char * tenant,
     size_t tenant_len, int which, const GDEFSTOR_ModelVisitor * visitor) {
   MModel * m = (MModel *)ctx;
@@ -1560,6 +1704,12 @@ static GDEFSTOR_Result m_dump(void * ctx, const char * tenant,
       GDEFSTOR_Result rc;
       lend_draft(&t->drafts[i], &d);
       rc = visitor->draft(visitor->ctx, &d);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+    {
+      GDEFSTOR_Result rc = sys_dump(t, visitor);
       if (rc != GDEFSTOR_OK) {
         return rc;
       }
@@ -1788,6 +1938,642 @@ static GDEFSTOR_Result m_blind_delete(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+/* ---- records, counters and the outbox ------------------------------------ */
+
+/* Byte order, a prefix first. */
+static int span_cmp(const char * a, size_t an, const char * b, size_t bn) {
+  size_t n = an < bn ? an : bn;
+  int c = n == 0 ? 0 : memcmp(a, b, n);
+  if (c != 0) {
+    return c;
+  }
+  return an < bn ? -1 : (an > bn ? 1 : 0);
+}
+
+/* The index of the first committed record of @p t not below (ns, key), and
+ * whether it is that record. */
+static size_t rec_lower(const MTen * t, const char * ns, size_t ns_len,
+    const char * key, size_t key_len, int * out_found) {
+  size_t lo = 0;
+  size_t hi = t == NULL ? 0 : t->nrec;
+  *out_found = 0;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    const MRec * r = &t->recs[mid];
+    int c = span_cmp(r->ns, r->ns_len, ns, ns_len);
+    if (c == 0) {
+      c = span_cmp(r->key, r->key_len, key, key_len);
+    }
+    if (c < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (t != NULL && lo < t->nrec &&
+      same(t->recs[lo].ns, t->recs[lo].ns_len, ns, ns_len) &&
+      same(t->recs[lo].key, t->recs[lo].key_len, key, key_len)) {
+    *out_found = 1;
+  }
+  return lo;
+}
+
+/* The transaction's put or delete of (ns, key), or NULL. */
+static MRec * rput_find(MTxn * x, const char * ns, size_t ns_len,
+    const char * key, size_t key_len) {
+  size_t i;
+  for (i = 0; i < x->nrput; i++) {
+    if (same(x->rput[i].ns, x->rput[i].ns_len, ns, ns_len) &&
+        same(x->rput[i].key, x->rput[i].key_len, key, key_len)) {
+      return &x->rput[i];
+    }
+  }
+  return NULL;
+}
+
+/* A new entry of the transaction's records for (ns, key), taking @p bytes. */
+static GDEFSTOR_Result rput_add(MModel * m, MTxn * x, const char * ns,
+    size_t ns_len, const char * key, size_t key_len, uint8_t * bytes,
+    size_t len, int dead) {
+  MRec n;
+  void * more = grown(m->alloc, x->rput, x->nrput, &x->caprput,
+      sizeof *x->rput);
+  memset(&n, 0, sizeof n);
+  if (more != NULL) {
+    x->rput = more;
+    n.ns = str_copy(m->alloc, ns, ns_len);
+    n.key = str_copy(m->alloc, key, key_len);
+  }
+  if (more == NULL || n.ns == NULL || n.key == NULL) {
+    gcu_allocator_free(m->alloc, n.ns);
+    gcu_allocator_free(m->alloc, n.key);
+    gcu_allocator_free(m->alloc, bytes);
+    return GDEFSTOR_ERR_OOM;
+  }
+  n.ns_len = ns_len;
+  n.key_len = key_len;
+  n.bytes = bytes;
+  n.len = len;
+  n.dead = dead;
+  x->rput[x->nrput] = n;
+  x->nrput += 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_record_put(void * ctx, void * txn,
+    const GDEFSTOR_ModelRecord * r) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  uint8_t * bytes = NULL;
+  MRec * o;
+  if (x == NULL || r == NULL || (r->bytes == NULL && r->len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (r->len > 0) {
+    bytes = (uint8_t *)gcu_allocator_malloc(m->alloc, r->len);
+    if (bytes == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    memcpy(bytes, r->bytes, r->len);
+  }
+  /* Kept in the transaction until it commits (sys_apply). */
+  o = rput_find(x, r->ns, r->ns_len, r->key, r->key_len);
+  if (o != NULL) {
+    gcu_allocator_free(m->alloc, o->bytes);
+    o->bytes = bytes;
+    o->len = r->len;
+    o->dead = 0;
+    return GDEFSTOR_OK;
+  }
+  return rput_add(m, x, r->ns, r->ns_len, r->key, r->key_len, bytes, r->len,
+      0);
+}
+
+static GDEFSTOR_Result m_record_delete(void * ctx, void * txn, const char * ns,
+    size_t ns_len, const char * key, size_t key_len, int * out_deleted) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MRec * o;
+  int found = 0;
+  GDEFSTOR_Result rc;
+  if (x == NULL || out_deleted == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  o = rput_find(x, ns, ns_len, key, key_len);
+  if (o != NULL) {
+    *out_deleted = !o->dead;
+    gcu_allocator_free(m->alloc, o->bytes);
+    o->bytes = NULL;
+    o->len = 0;
+    o->dead = 1;
+    return GDEFSTOR_OK;
+  }
+  rec_lower(x->ten, ns, ns_len, key, key_len, &found);
+  if (!found) {
+    *out_deleted = 0;
+    return GDEFSTOR_OK;
+  }
+  rc = rput_add(m, x, ns, ns_len, key, key_len, NULL, 0, 1);
+  if (rc == GDEFSTOR_OK) {
+    *out_deleted = 1;
+  }
+  return rc;
+}
+
+static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
+    const MRec * r) {
+  GDEFSTOR_ModelRecord out;
+  memset(&out, 0, sizeof out);
+  out.ns = r->ns;
+  out.ns_len = r->ns_len;
+  out.key = r->key;
+  out.key_len = r->key_len;
+  out.bytes = r->bytes;
+  out.len = r->len;
+  return v->record(v->ctx, &out);
+}
+
+static GDEFSTOR_Result m_record_get(void * ctx, void * txn,
+    const char * tenant, size_t tenant_len, const char * ns, size_t ns_len,
+    const char * key, size_t key_len, const GDEFSTOR_ModelVisitor * visitor) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MTen * t = view_tenant(m, x, tenant, tenant_len);
+  int found = 0;
+  size_t at;
+  if (visitor == NULL || visitor->record == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (x != NULL) {
+    const MRec * o = rput_find(x, ns, ns_len, key, key_len);
+    if (o != NULL) {
+      return o->dead ? GDEFSTOR_OK : visit_record(visitor, o);
+    }
+  }
+  at = rec_lower(t, ns, ns_len, key, key_len, &found);
+  return found ? visit_record(visitor, &t->recs[at]) : GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_record_list(void * ctx, const char * tenant,
+    size_t tenant_len, const char * ns, size_t ns_len, const char * prefix,
+    size_t prefix_len, uint64_t offset, size_t limit,
+    const GDEFSTOR_ModelVisitor * visitor) {
+  MModel * m = (MModel *)ctx;
+  MTen * t = ten_find(m, tenant, tenant_len);
+  uint64_t skipped = 0;
+  size_t given = 0;
+  int found = 0;
+  size_t i;
+  if (visitor == NULL || visitor->record == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (t == NULL) {
+    return GDEFSTOR_OK;
+  }
+  for (i = rec_lower(t, ns, ns_len, prefix, prefix_len, &found);
+       i < t->nrec && given < limit; i++) {
+    const MRec * r = &t->recs[i];
+    GDEFSTOR_Result rc;
+    if (!same(r->ns, r->ns_len, ns, ns_len) || r->key_len < prefix_len ||
+        (prefix_len > 0 && memcmp(r->key, prefix, prefix_len) != 0)) {
+      break; /* sorted: past the namespace or the prefix */
+    }
+    if (skipped < offset) {
+      skipped++;
+      continue;
+    }
+    rc = visit_record(visitor, r);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+    given++;
+  }
+  return GDEFSTOR_OK;
+}
+
+static MCnt * cnt_find(MCnt * v, size_t n, int kind, const char * name,
+    size_t name_len) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    if (v[i].kind == kind && same(v[i].name, v[i].name_len, name, name_len)) {
+      return &v[i];
+    }
+  }
+  return NULL;
+}
+
+static GDEFSTOR_Result m_counter_next(void * ctx, void * txn, int kind,
+    const char * name, size_t name_len, uint64_t * out_value) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MTen * t;
+  MCnt * ov;
+  MCnt * cm;
+  MCnt * fl = NULL;
+  uint64_t cur;
+  uint64_t flv;
+  uint64_t base;
+  char * ov_name = NULL;
+  char * fl_name = NULL;
+  if (x == NULL || out_value == NULL ||
+      (kind != GDEFSTOR_MODEL_COUNTER && kind != GDEFSTOR_MODEL_STREAM)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  t = x->ten;
+  ov = cnt_find(x->cset, x->ncset, kind, name, name_len);
+  cm = cnt_find(t->cnts, t->ncnt, kind, name, name_len);
+  if (kind == GDEFSTOR_MODEL_COUNTER) {
+    fl = cnt_find(t->floors, t->nfloor, kind, name, name_len);
+  }
+  cur = ov != NULL ? ov->value : (cm != NULL ? cm->value : 0);
+  flv = fl != NULL ? fl->value : 0;
+  base = cur > flv ? cur : flv;
+  if (base >= (uint64_t)INT64_MAX) {
+    return GDEFSTOR_ERR_LIMIT;
+  }
+  /* Every allocation first, so that a value handed out is recorded in both
+   * places or in neither. */
+  if (ov == NULL) {
+    void * more = grown(m->alloc, x->cset, x->ncset, &x->capcset,
+        sizeof *x->cset);
+    if (more == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    x->cset = more;
+    ov_name = str_copy(m->alloc, name, name_len);
+    if (ov_name == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+  }
+  if (kind == GDEFSTOR_MODEL_COUNTER && fl == NULL) {
+    void * more = grown(m->alloc, t->floors, t->nfloor, &t->capfloor,
+        sizeof *t->floors);
+    if (more != NULL) {
+      t->floors = more;
+      fl_name = str_copy(m->alloc, name, name_len);
+    }
+    if (fl_name == NULL) {
+      gcu_allocator_free(m->alloc, ov_name);
+      return GDEFSTOR_ERR_OOM;
+    }
+  }
+  if (ov == NULL) {
+    ov = &x->cset[x->ncset];
+    x->ncset += 1;
+    ov->kind = kind;
+    ov->name = ov_name;
+    ov->name_len = name_len;
+  }
+  ov->value = base + 1;
+  /* The floor is the committed tenant's, written now, outside the
+   * transaction: whatever becomes of it, this value stays taken. */
+  if (kind == GDEFSTOR_MODEL_COUNTER) {
+    if (fl == NULL) {
+      fl = &t->floors[t->nfloor];
+      t->nfloor += 1;
+      fl->kind = kind;
+      fl->name = fl_name;
+      fl->name_len = name_len;
+    }
+    fl->value = base + 1;
+  }
+  *out_value = base + 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_counter_get(void * ctx, const char * tenant,
+    size_t tenant_len, int kind, const char * name, size_t name_len,
+    uint64_t * out_value) {
+  MModel * m = (MModel *)ctx;
+  MTen * t = ten_find(m, tenant, tenant_len);
+  const MCnt * c;
+  if (out_value == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  c = t == NULL ? NULL : cnt_find(t->cnts, t->ncnt, kind, name, name_len);
+  *out_value = c == NULL ? 0 : c->value;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result ob_copy(const GDEFSMEMORY_Allocator * a, MOb * dst,
+    const MOb * src) {
+  MOb n = *src;
+  n.stream = str_copy(a, src->stream, src->stream_len);
+  n.pid = str_copy(a, src->pid, src->pid_len);
+  n.fmt = str_copy(a, src->fmt, src->fmt_len);
+  n.payload = NULL;
+  if (src->payload_len > 0) {
+    n.payload = (uint8_t *)gcu_allocator_malloc(a, src->payload_len);
+    if (n.payload != NULL) {
+      memcpy(n.payload, src->payload, src->payload_len);
+    }
+  }
+  if (n.stream == NULL || n.pid == NULL || n.fmt == NULL ||
+      (src->payload_len > 0 && n.payload == NULL)) {
+    ob_free(a, &n);
+    return GDEFSTOR_ERR_OOM;
+  }
+  *dst = n;
+  return GDEFSTOR_OK;
+}
+
+/* The transaction's own copy of the outbox, made on first touch. */
+static GDEFSTOR_Result obs_touch(MModel * m, MTxn * x) {
+  const MTen * t = x->ten;
+  size_t i;
+  if (x->obs_copied) {
+    return GDEFSTOR_OK;
+  }
+  if (t->nob > 0) {
+    x->obs = (MOb *)gcu_allocator_calloc(m->alloc, t->nob, sizeof *x->obs);
+    if (x->obs == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    for (i = 0; i < t->nob; i++) {
+      if (ob_copy(m->alloc, &x->obs[i], &t->obs[i]) != GDEFSTOR_OK) {
+        obs_free(m->alloc, x->obs, i);
+        x->obs = NULL;
+        return GDEFSTOR_ERR_OOM;
+      }
+    }
+  }
+  x->nob = t->nob;
+  x->capob = t->nob;
+  x->obs_copied = 1;
+  return GDEFSTOR_OK;
+}
+
+static size_t ob_find(const MOb * v, size_t n, const char * pid,
+    size_t pid_len) {
+  size_t i;
+  for (i = 0; i < n; i++) {
+    if (same(v[i].pid, v[i].pid_len, pid, pid_len)) {
+      return i;
+    }
+  }
+  return n;
+}
+
+static GDEFSTOR_Result m_outbox_insert(void * ctx, void * txn,
+    const GDEFSTOR_ModelOutbox * o) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MOb src;
+  MOb n;
+  size_t at;
+  void * more;
+  GDEFSTOR_Result rc;
+  if (x == NULL || o == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = obs_touch(m, x);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  if (ob_find(x->obs, x->nob, o->public_id, o->public_id_len) < x->nob) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  memset(&src, 0, sizeof src);
+  src.stream = (char *)o->stream;
+  src.stream_len = o->stream_len;
+  src.seq = o->seq;
+  src.pid = (char *)o->public_id;
+  src.pid_len = o->public_id_len;
+  src.fmt = (char *)o->format;
+  src.fmt_len = o->format_len;
+  src.payload = (uint8_t *)o->payload;
+  src.payload_len = o->payload_len;
+  more = grown(m->alloc, x->obs, x->nob, &x->capob, sizeof *x->obs);
+  if (more == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  x->obs = more;
+  rc = ob_copy(m->alloc, &n, &src);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  /* In order: by stream, then sequence. */
+  for (at = x->nob; at > 0; at--) {
+    const MOb * p = &x->obs[at - 1];
+    int c = span_cmp(p->stream, p->stream_len, n.stream, n.stream_len);
+    if (c < 0 || (c == 0 && p->seq < n.seq)) {
+      break;
+    }
+  }
+  memmove(&x->obs[at + 1], &x->obs[at], (x->nob - at) * sizeof *x->obs);
+  x->obs[at] = n;
+  x->nob += 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result visit_ob(const GDEFSTOR_ModelVisitor * v,
+    const MOb * o) {
+  GDEFSTOR_ModelOutbox out;
+  memset(&out, 0, sizeof out);
+  out.stream = o->stream;
+  out.stream_len = o->stream_len;
+  out.seq = o->seq;
+  out.public_id = o->pid;
+  out.public_id_len = o->pid_len;
+  out.format = o->fmt;
+  out.format_len = o->fmt_len;
+  out.payload = o->payload;
+  out.payload_len = o->payload_len;
+  out.lease_until_ms = o->until;
+  out.failures = o->fails;
+  out.parked = o->parked;
+  return v->outbox(v->ctx, &out);
+}
+
+static GDEFSTOR_Result m_outbox_claim(void * ctx, void * txn,
+    const char * stream, size_t stream_len, int64_t now_ms, int64_t until_ms,
+    size_t max, const GDEFSTOR_ModelVisitor * visitor) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  size_t taken = 0;
+  size_t i;
+  GDEFSTOR_Result rc;
+  if (x == NULL || visitor == NULL || visitor->outbox == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = obs_touch(m, x);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  /* One live claim per stream: while a lease holds, nothing is taken. */
+  for (i = 0; i < x->nob; i++) {
+    const MOb * o = &x->obs[i];
+    if (same(o->stream, o->stream_len, stream, stream_len) && !o->parked &&
+        o->until > now_ms) {
+      return GDEFSTOR_OK;
+    }
+  }
+  for (i = 0; i < x->nob && taken < max; i++) {
+    MOb * o = &x->obs[i];
+    if (!same(o->stream, o->stream_len, stream, stream_len) || o->parked) {
+      continue;
+    }
+    o->until = until_ms;
+    rc = visit_ob(visitor, o);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+    taken++;
+  }
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_outbox_delete(void * ctx, void * txn,
+    const char * public_id, size_t public_id_len, int * out_deleted) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  size_t at;
+  GDEFSTOR_Result rc;
+  if (x == NULL || out_deleted == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = obs_touch(m, x);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  *out_deleted = 0;
+  at = ob_find(x->obs, x->nob, public_id, public_id_len);
+  if (at == x->nob || x->obs[at].parked) {
+    return GDEFSTOR_OK; /* gone already, or parked: never deleted */
+  }
+  ob_free(m->alloc, &x->obs[at]);
+  memmove(&x->obs[at], &x->obs[at + 1], (x->nob - at - 1) * sizeof *x->obs);
+  x->nob -= 1;
+  *out_deleted = 1;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_outbox_fail(void * ctx, void * txn,
+    const char * public_id, size_t public_id_len, int64_t now_ms,
+    uint32_t park_at, int * out_found, int * out_parked) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  size_t at;
+  MOb * o;
+  GDEFSTOR_Result rc;
+  if (x == NULL || out_found == NULL || out_parked == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  rc = obs_touch(m, x);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  *out_parked = 0;
+  at = ob_find(x->obs, x->nob, public_id, public_id_len);
+  *out_found = at < x->nob;
+  if (at == x->nob) {
+    return GDEFSTOR_OK;
+  }
+  o = &x->obs[at];
+  if (!o->parked) {
+    o->fails += 1;
+    if (o->fails >= park_at) {
+      /* Parked: kept, counted, never claimed again. */
+      o->parked = 1;
+      o->until = 0;
+    } else {
+      o->until = now_ms;
+    }
+  }
+  *out_parked = o->parked;
+  return GDEFSTOR_OK;
+}
+
+static GDEFSTOR_Result m_outbox_parked(void * ctx, const char * tenant,
+    size_t tenant_len, const char * stream, size_t stream_len,
+    uint64_t * out_count) {
+  MModel * m = (MModel *)ctx;
+  const MTen * t = ten_find(m, tenant, tenant_len);
+  uint64_t n = 0;
+  size_t i;
+  if (out_count == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (i = 0; t != NULL && i < t->nob; i++) {
+    const MOb * o = &t->obs[i];
+    n += o->parked &&
+         (stream_len == 0 || same(o->stream, o->stream_len, stream, stream_len));
+  }
+  *out_count = n;
+  return GDEFSTOR_OK;
+}
+
+/* Commit's part for these families, after room was made for them: nothing
+ * here can fail. The transaction's entries move into the tenant. */
+static void sys_apply(const GDEFSMEMORY_Allocator * a, MTen * t, MTxn * x) {
+  size_t i;
+  for (i = 0; i < x->nrput; i++) {
+    MRec * o = &x->rput[i];
+    int found = 0;
+    size_t at = rec_lower(t, o->ns, o->ns_len, o->key, o->key_len, &found);
+    if (o->dead) {
+      if (found) {
+        rec_free(a, &t->recs[at]);
+        memmove(&t->recs[at], &t->recs[at + 1],
+            (t->nrec - at - 1) * sizeof *t->recs);
+        t->nrec -= 1;
+      }
+      rec_free(a, o);
+    } else if (found) {
+      gcu_allocator_free(a, t->recs[at].bytes);
+      t->recs[at].bytes = o->bytes;
+      t->recs[at].len = o->len;
+      o->bytes = NULL;
+      rec_free(a, o);
+    } else {
+      memmove(&t->recs[at + 1], &t->recs[at], (t->nrec - at) * sizeof *t->recs);
+      t->recs[at] = *o;
+      t->nrec += 1;
+      memset(o, 0, sizeof *o);
+    }
+  }
+  x->nrput = 0;
+  for (i = 0; i < x->ncset; i++) {
+    MCnt * c = &x->cset[i];
+    MCnt * cm = cnt_find(t->cnts, t->ncnt, c->kind, c->name, c->name_len);
+    if (cm != NULL) {
+      cm->value = c->value;
+      gcu_allocator_free(a, c->name);
+    } else {
+      t->cnts[t->ncnt] = *c;
+      t->ncnt += 1;
+    }
+    memset(c, 0, sizeof *c);
+  }
+  x->ncset = 0;
+  if (x->obs_copied) {
+    obs_free(a, t->obs, t->nob);
+    t->obs = x->obs;
+    t->nob = x->nob;
+    t->capob = x->capob;
+    x->obs = NULL;
+    x->nob = 0;
+    x->obs_copied = 0;
+  }
+}
+
+static GDEFSTOR_Result sys_dump(const MTen * t,
+    const GDEFSTOR_ModelVisitor * v) {
+  size_t i;
+  GDEFSTOR_Result rc = GDEFSTOR_OK;
+  for (i = 0; v->record != NULL && rc == GDEFSTOR_OK && i < t->nrec; i++) {
+    rc = visit_record(v, &t->recs[i]);
+  }
+  for (i = 0; v->counter != NULL && rc == GDEFSTOR_OK && i < t->ncnt; i++) {
+    rc = v->counter(v->ctx, t->cnts[i].kind, t->cnts[i].name,
+        t->cnts[i].name_len, t->cnts[i].value);
+  }
+  for (i = 0; v->outbox != NULL && rc == GDEFSTOR_OK && i < t->nob; i++) {
+    rc = visit_ob(v, &t->obs[i]);
+  }
+  return rc;
+}
+
 GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
     GDEFSTOR_ModelBackend * out) {
   MModel * m = (MModel *)gcu_allocator_calloc(alloc, 1, sizeof *m);
@@ -1822,5 +2608,17 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->blind_history = m_blind_history;
   out->subject_lookup = m_subject_lookup;
   out->blind_delete = m_blind_delete;
+  out->sys_ctx = m;
+  out->record_put = m_record_put;
+  out->record_delete = m_record_delete;
+  out->record_get = m_record_get;
+  out->record_list = m_record_list;
+  out->counter_next = m_counter_next;
+  out->counter_get = m_counter_get;
+  out->outbox_insert = m_outbox_insert;
+  out->outbox_claim = m_outbox_claim;
+  out->outbox_delete = m_outbox_delete;
+  out->outbox_fail = m_outbox_fail;
+  out->outbox_parked = m_outbox_parked;
   return GDEFSTOR_OK;
 }
