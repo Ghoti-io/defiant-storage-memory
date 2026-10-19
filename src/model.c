@@ -187,6 +187,18 @@ typedef struct MSt {
   int64_t when;
 } MSt;
 
+/* A blind row (AD-14): truth while its subject exists, kept per entity. */
+typedef struct MBlind {
+  uint64_t item;
+  uint64_t from;
+  uint32_t field;
+  uint8_t * subject;
+  size_t subject_len;
+  uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES];
+  uint32_t key_id;
+  uint32_t version;
+} MBlind;
+
 typedef struct MEnt {
   uint64_t row;
   char * type;
@@ -210,6 +222,9 @@ typedef struct MEnt {
   MVer * cur; /* derived: the current table */
   size_t ncur;
   size_t capcur;
+  MBlind * blinds; /* the blind table's rows of this entity: never derived */
+  size_t nblind;
+  size_t capblind;
   int pub;     /* derived: the newest state */
   int del;
 } MEnt;
@@ -232,6 +247,10 @@ static void ent_free(const GDEFSMEMORY_Allocator * a, MEnt * e) {
   for (i = 0; i < e->ncur; i++) {
     ver_free(a, &e->cur[i]);
   }
+  for (i = 0; i < e->nblind; i++) {
+    gcu_allocator_free(a, e->blinds[i].subject);
+  }
+  gcu_allocator_free(a, e->blinds);
   gcu_allocator_free(a, e->revs);
   gcu_allocator_free(a, e->sts);
   gcu_allocator_free(a, e->vers);
@@ -328,6 +347,24 @@ static GDEFSTOR_Result ent_copy(const GDEFSMEMORY_Allocator * a,
         return GDEFSTOR_ERR_OOM;
       }
       c->ncur = i + 1;
+    }
+  }
+  if (e->nblind > 0) {
+    c->blinds = (MBlind *)gcu_allocator_calloc(a, e->nblind, sizeof *c->blinds);
+    if (c->blinds == NULL) {
+      ent_free(a, c);
+      return GDEFSTOR_ERR_OOM;
+    }
+    c->capblind = e->nblind;
+    for (i = 0; i < e->nblind; i++) {
+      c->blinds[i] = e->blinds[i];
+      c->blinds[i].subject = (uint8_t *)str_copy(a,
+          (const char *)e->blinds[i].subject, e->blinds[i].subject_len);
+      c->nblind = i + 1;
+      if (c->blinds[i].subject == NULL) {
+        ent_free(a, c);
+        return GDEFSTOR_ERR_OOM;
+      }
     }
   }
   *out = c;
@@ -1108,6 +1145,30 @@ static GDEFSTOR_Result visit_ver(const GDEFSTOR_ModelVisitor * v, uint64_t row,
   return v->item(v->ctx, row, &i);
 }
 
+static GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v,
+    const MEnt * e) {
+  size_t i;
+  for (i = 0; v->blind != NULL && i < e->nblind; i++) {
+    const MBlind * x = &e->blinds[i];
+    GDEFSTOR_ModelBlind b;
+    GDEFSTOR_Result rc;
+    memset(&b, 0, sizeof b);
+    b.item = x->item;
+    b.valid_from = x->from;
+    b.field = x->field;
+    b.subject = x->subject;
+    b.subject_len = x->subject_len;
+    b.mac = x->mac;
+    b.key_id = x->key_id;
+    b.version = x->version;
+    rc = v->blind(v->ctx, e->row, &b);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result m_entity_find(void * ctx, void * txn,
     const char * tenant, size_t tenant_len, const char * public_id,
     size_t public_id_len, const GDEFSTOR_ModelVisitor * visitor) {
@@ -1268,6 +1329,36 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
     }
     e->ncur += 1;
   }
+  for (i = 0; i < a->blind_count; i++) {
+    const GDEFSTOR_ModelBlind * b = &a->blinds[i];
+    MBlind * n;
+    size_t k;
+    int indexed = 0;
+    /* A blind row indexes a version this same apply writes. */
+    for (k = 0; k < a->insert_count; k++) {
+      indexed |= a->inserts[k].item == b->item;
+    }
+    if (!indexed || b->valid_from != rev || b->mac == NULL ||
+        (b->subject == NULL && b->subject_len != 0)) {
+      return GDEFSTOR_ERR_INTERNAL;
+    }
+    GROW_OR_OOM(m->alloc, e->blinds, e->nblind, e->capblind);
+    n = &e->blinds[e->nblind];
+    memset(n, 0, sizeof *n);
+    n->subject = (uint8_t *)str_copy(m->alloc, (const char *)b->subject,
+        b->subject_len);
+    if (n->subject == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    n->item = b->item;
+    n->from = b->valid_from;
+    n->field = b->field;
+    n->subject_len = b->subject_len;
+    memcpy(n->mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+    n->key_id = b->key_id;
+    n->version = b->version;
+    e->nblind += 1;
+  }
   GROW_OR_OOM(m->alloc, e->revs, e->nrev, e->caprev);
   if (x->seq == 0) {
     x->seq = x->ten->commit_seq + 1;
@@ -1357,7 +1448,7 @@ static GDEFSTOR_Result m_items(void * ctx, void * txn, const char * tenant,
         return rc;
       }
     }
-    return GDEFSTOR_OK;
+    return visit_blinds(visitor, e);
   }
   for (i = 0; i < e->nver; i++) {
     const MVer * v = &e->vers[i];
@@ -1368,7 +1459,7 @@ static GDEFSTOR_Result m_items(void * ctx, void * txn, const char * tenant,
       }
     }
   }
-  return GDEFSTOR_OK;
+  return visit_blinds(visitor, e);
 }
 
 /* ---- queries, rebuild, dump ---------------------------------------------- */
@@ -1396,6 +1487,9 @@ static GDEFSTOR_Result m_scan(void * ctx, const char * type, size_t type_len,
     rc = visitor->entity(visitor->ctx, &out);
     for (i = 0; rc == GDEFSTOR_OK && i < e->ncur; i++) {
       rc = visit_ver(visitor, e->row, &e->cur[i]);
+    }
+    if (rc == GDEFSTOR_OK) {
+      rc = visit_blinds(visitor, e);
     }
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1483,6 +1577,9 @@ static GDEFSTOR_Result m_dump(void * ctx, const char * tenant,
       for (k = 0; rc == GDEFSTOR_OK && k < e->nver; k++) {
         rc = visit_ver(visitor, e->row, &e->vers[k]);
       }
+      if (rc == GDEFSTOR_OK) {
+        rc = visit_blinds(visitor, e);
+      }
     } else {
       for (k = 0; rc == GDEFSTOR_OK && k < e->ncur; k++) {
         rc = visit_ver(visitor, e->row, &e->cur[k]);
@@ -1529,6 +1626,168 @@ static GDEFSTOR_Result m_index_state(void * ctx, const char * tenant,
   return GDEFSTOR_OK;
 }
 
+/* ---- the blind index ---------------------------------------------------- */
+
+/* The valid_to of version (item, from) of @p e: 0 open, UINT64_MAX none. */
+static uint64_t version_to(const MEnt * e, uint64_t item, uint64_t from) {
+  size_t i;
+  for (i = 0; i < e->nver; i++) {
+    if (e->vers[i].item == item && e->vers[i].from == from) {
+      return e->vers[i].to;
+    }
+  }
+  return UINT64_MAX;
+}
+
+static GDEFSTOR_Result m_blind_history(void * ctx, const char * tenant,
+    size_t tenant_len, const GDEFSTOR_Type * type, size_t field,
+    const uint8_t * mac, GDEFSTOR_ModelBlindFn fn, void * fn_ctx) {
+  MModel * m = (MModel *)ctx;
+  MTen * t = ten_find(m, tenant, tenant_len);
+  GDEFSTOR_FieldInfo f;
+  const char * name = NULL;
+  size_t name_len = 0;
+  size_t r;
+  memset(&f, 0, sizeof f);
+  f.size = sizeof f;
+  if (type == NULL || mac == NULL || fn == NULL ||
+      gdefstor_type_name(type, &name, &name_len) != GDEFSTOR_OK ||
+      gdefstor_type_field(type, field, &f) != GDEFSTOR_OK) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (r = 0; t != NULL && r < t->nent; r++) {
+    const MEnt * e = t->ents[r];
+    size_t i;
+    if (!same(e->type, e->type_len, name, name_len)) {
+      continue;
+    }
+    for (i = 0; i < e->nblind; i++) {
+      const MBlind * b = &e->blinds[i];
+      GDEFSTOR_ModelBlindHit h;
+      GDEFSTOR_Result rc;
+      if (b->field != f.id ||
+          memcmp(b->mac, mac, GDEFSTOR_BLIND_MAC_BYTES) != 0) {
+        continue;
+      }
+      memset(&h, 0, sizeof h);
+      h.valid_to = version_to(e, b->item, b->from);
+      if (h.valid_to == UINT64_MAX) {
+        return GDEFSTOR_ERR_CORRUPT; /* a blind row with no version */
+      }
+      h.row = e->row;
+      h.public_id = e->pid;
+      h.public_id_len = e->pid_len;
+      h.item = b->item;
+      h.valid_from = b->from;
+      h.subject = b->subject;
+      h.subject_len = b->subject_len;
+      h.key_id = b->key_id;
+      h.version = b->version;
+      rc = fn(fn_ctx, &h);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+/* Every version's subject columns. The memory backend has no index and no
+ * blind table to confuse with them: a value carries its subject exactly when
+ * it is personal. */
+static GDEFSTOR_Result m_subject_lookup(void * ctx, const char * tenant,
+    size_t tenant_len, const uint8_t * subject, size_t subject_len,
+    GDEFSTOR_ModelSubjectFn fn, void * fn_ctx) {
+  MModel * m = (MModel *)ctx;
+  MTen * t = ten_find(m, tenant, tenant_len);
+  size_t r;
+  if (fn == NULL || (subject == NULL && subject_len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (r = 0; t != NULL && r < t->nent; r++) {
+    const MEnt * e = t->ents[r];
+    size_t i;
+    for (i = 0; i < e->nver; i++) {
+      const MVer * v = &e->vers[i];
+      size_t k;
+      for (k = 0; k < v->nvals; k++) {
+        GDEFSTOR_ModelSubjectHit h;
+        GDEFSTOR_Result rc;
+        if (v->vals[k].type == 0 ||
+            !same((const char *)v->vals[k].subject, v->vals[k].subject_len,
+                (const char *)subject, subject_len)) {
+          continue;
+        }
+        memset(&h, 0, sizeof h);
+        h.type = e->type;
+        h.type_len = e->type_len;
+        h.row = e->row;
+        h.public_id = e->pid;
+        h.public_id_len = e->pid_len;
+        h.group = v->group;
+        h.column = (uint32_t)k;
+        h.item = v->item;
+        h.valid_from = v->from;
+        h.valid_to = v->to;
+        rc = fn(fn_ctx, &h);
+        if (rc != GDEFSTOR_OK) {
+          return rc;
+        }
+      }
+    }
+  }
+  return GDEFSTOR_OK;
+}
+
+static int names_subject(const MEnt * e, const uint8_t * subject,
+    size_t subject_len) {
+  size_t i;
+  for (i = 0; i < e->nblind; i++) {
+    if (same((const char *)e->blinds[i].subject, e->blinds[i].subject_len,
+            (const char *)subject, subject_len)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Every entity of the tenant, committed or made in this transaction, whose
+ * blind rows name the subject: its own copy, with those rows gone. */
+static GDEFSTOR_Result m_blind_delete(void * ctx, void * txn,
+    const uint8_t * subject, size_t subject_len) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  uint64_t row;
+  if (x == NULL || (subject == NULL && subject_len != 0)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  for (row = 1; row < x->next_row; row++) {
+    MEnt * e = ent_view(x->ten, x, row);
+    size_t i;
+    size_t kept = 0;
+    GDEFSTOR_Result rc;
+    if (e == NULL || !names_subject(e, subject, subject_len)) {
+      continue;
+    }
+    if (row <= x->ten->nent) {
+      rc = ent_touch(m, x, row, &e);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+    for (i = 0; i < e->nblind; i++) {
+      if (same((const char *)e->blinds[i].subject, e->blinds[i].subject_len,
+              (const char *)subject, subject_len)) {
+        gcu_allocator_free(m->alloc, e->blinds[i].subject);
+      } else {
+        e->blinds[kept++] = e->blinds[i];
+      }
+    }
+    e->nblind = kept;
+  }
+  return GDEFSTOR_OK;
+}
+
 GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
     GDEFSTOR_ModelBackend * out) {
   MModel * m = (MModel *)gcu_allocator_calloc(alloc, 1, sizeof *m);
@@ -1559,5 +1818,9 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->dump = m_dump;
   out->index_ctx = m;
   out->index_state = m_index_state;
+  out->blind_ctx = m;
+  out->blind_history = m_blind_history;
+  out->subject_lookup = m_subject_lookup;
+  out->blind_delete = m_blind_delete;
   return GDEFSTOR_OK;
 }

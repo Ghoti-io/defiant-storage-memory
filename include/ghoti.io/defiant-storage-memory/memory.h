@@ -46,7 +46,10 @@ extern "C" {
  * @brief Open an in-memory store, with the entity port (model.h).
  *
  * Queries over entities are answered by the port's reference scan
- * (gdefstor_model_scan()) over the current tables of the last commit.
+ * (gdefstor_model_scan()) over the current tables of the last commit. It
+ * keeps the blind index too (model_backend.h): blind rows beside each
+ * entity's versions, never derived, read by scanning, so the history and
+ * subject lookups and a subject's deletion visit every entity of the tenant.
  *
  * @param allocator NULL uses gdefsmemory_allocator_default().
  * @param limits NULL uses the port's defaults. Passed through to the port.
