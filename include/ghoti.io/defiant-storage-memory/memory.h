@@ -64,8 +64,10 @@ GDEFSMEMORY_API GDEFSMEMORY_Result gdefsmemory_store_create(
  * @brief Open an in-memory key store over a caller's cipher.
  *
  * Keys are made with @p cipher's randomness and never leave the key store;
- * wrap and unwrap seal and open with @p cipher under them. Nothing survives
- * the process: this is for tests and development, never for a deployment.
+ * wrap and unwrap seal and open with @p cipher under them. It also keeps
+ * sealed material, tenant secrets and the key set (keystore.h). Nothing
+ * survives the process: this is for tests and development, never for a
+ * deployment.
  *
  * @param allocator NULL uses gdefsmemory_allocator_default().
  * @param cipher Copied. Required, with every member set.
