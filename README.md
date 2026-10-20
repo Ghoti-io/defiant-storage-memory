@@ -23,7 +23,10 @@ write is open. Entity queries are answered by the port's reference engine,
 rows (story S6a) live beside the entities: a write keeps its record puts and
 deletes and its counter values apart and moves them in at commit, copies the
 outbox on first touch, and writes each counter's floor into the committed
-tenant at once, so a value an aborted write took is never taken again.
+tenant at once, so a value an aborted write took is never taken again. It
+has the restore members a snapshot import writes through (story S6a3): a
+revision that keeps its commit sequence, a counter set to its value, an
+outbox row with its lease, failures and parked flag.
 `gdefsmemory_keystore_create`
 opens a key store (`defiant-storage/keystore.h`) over a cipher the caller
 supplies; it keeps keys in the process, which makes it for tests only.

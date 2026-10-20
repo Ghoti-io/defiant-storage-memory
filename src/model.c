@@ -526,6 +526,9 @@ typedef struct MTxn {
   size_t capdraft;
   int drafts_copied;
   uint64_t seq;
+  /* The largest commit sequence an import restored in this transaction
+   * (m_restore_revision): the tenant's is raised to it at commit. */
+  uint64_t restored;
   MRec * rput; /* records put or deleted, one entry per key */
   size_t nrput;
   size_t caprput;
@@ -1010,6 +1013,9 @@ static GDEFSTOR_Result m_commit(void * ctx, void * txn) {
   }
   if (x->seq != 0) {
     t->commit_seq = x->seq;
+  }
+  if (x->restored > t->commit_seq) {
+    t->commit_seq = x->restored;
   }
   sys_apply(m->alloc, t, x);
   txn_unlink(m, x);
@@ -1535,7 +1541,9 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
   }
   GROW_OR_OOM(m->alloc, e->revs, e->nrev, e->caprev);
   if (x->seq == 0) {
-    x->seq = x->ten->commit_seq + 1;
+    x->seq = (x->ten->commit_seq > x->restored ? x->ten->commit_seq
+                                               : x->restored) +
+             1;
   }
   r = &e->revs[e->nrev];
   memset(r, 0, sizeof *r);
@@ -1558,6 +1566,36 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
   e->nrev += 1;
   e->revision = rev;
   e->last_item = a->last_item;
+  return GDEFSTOR_OK;
+}
+
+/* An import's revision (model_backend.h): an apply whose revision row keeps
+ * the commit sequence it is given; the tenant's is raised to it at commit. */
+static GDEFSTOR_Result m_restore_revision(void * ctx, void * txn,
+    const GDEFSTOR_ModelApply * a) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MEnt * e = NULL;
+  uint64_t seq;
+  GDEFSTOR_Result rc;
+  if (x == NULL || a == NULL || a->revision == NULL ||
+      a->revision->commit_seq == 0) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  seq = x->seq;
+  rc = m_apply(ctx, txn, a);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  x->seq = seq;
+  rc = ent_touch(m, x, a->row, &e);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  e->revs[e->nrev - 1].seq = a->revision->commit_seq;
+  if (a->revision->commit_seq > x->restored) {
+    x->restored = a->revision->commit_seq;
+  }
   return GDEFSTOR_OK;
 }
 
@@ -2328,6 +2366,40 @@ static GDEFSTOR_Result m_counter_next(void * ctx, void * txn, int kind,
   return GDEFSTOR_OK;
 }
 
+/* An import's counter: its value in this transaction, as a committed one
+ * would be once the transaction commits. Its floor is left as it is. */
+static GDEFSTOR_Result m_restore_counter(void * ctx, void * txn, int kind,
+    const char * name, size_t name_len, uint64_t value) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MCnt * ov;
+  if (x == NULL || name == NULL ||
+      (kind != GDEFSTOR_MODEL_COUNTER && kind != GDEFSTOR_MODEL_STREAM)) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  ov = cnt_find(x->cset, x->ncset, kind, name, name_len);
+  if (ov == NULL) {
+    char * n;
+    void * more = grown(m->alloc, x->cset, x->ncset, &x->capcset,
+        sizeof *x->cset);
+    if (more == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    x->cset = more;
+    n = str_copy(m->alloc, name, name_len);
+    if (n == NULL) {
+      return GDEFSTOR_ERR_OOM;
+    }
+    ov = &x->cset[x->ncset];
+    x->ncset += 1;
+    ov->kind = kind;
+    ov->name = n;
+    ov->name_len = name_len;
+  }
+  ov->value = value;
+  return GDEFSTOR_OK;
+}
+
 static GDEFSTOR_Result m_counter_get(void * ctx, const char * tenant,
     size_t tenant_len, int kind, const char * name, size_t name_len,
     uint64_t * out_value) {
@@ -2450,6 +2522,26 @@ static GDEFSTOR_Result m_outbox_insert(void * ctx, void * txn,
   memmove(&x->obs[at + 1], &x->obs[at], (x->nob - at) * sizeof *x->obs);
   x->obs[at] = n;
   x->nob += 1;
+  return GDEFSTOR_OK;
+}
+
+/* An import's outbox row: inserted as an append's is, then given the lease,
+ * failures and parked flag it had. */
+static GDEFSTOR_Result m_restore_outbox(void * ctx, void * txn,
+    const GDEFSTOR_ModelOutbox * o) {
+  MTxn * x = (MTxn *)txn;
+  size_t at;
+  GDEFSTOR_Result rc = m_outbox_insert(ctx, txn, o);
+  if (rc != GDEFSTOR_OK) {
+    return rc;
+  }
+  at = ob_find(x->obs, x->nob, o->public_id, o->public_id_len);
+  if (at == x->nob) {
+    return GDEFSTOR_ERR_INTERNAL;
+  }
+  x->obs[at].until = o->lease_until_ms;
+  x->obs[at].fails = o->failures;
+  x->obs[at].parked = o->parked != 0;
   return GDEFSTOR_OK;
 }
 
@@ -2709,5 +2801,9 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->outbox_parked = m_outbox_parked;
   out->lang_ctx = m;
   out->languages = m_languages;
+  out->restore_ctx = m;
+  out->restore_revision = m_restore_revision;
+  out->restore_counter = m_restore_counter;
+  out->restore_outbox = m_restore_outbox;
   return GDEFSTOR_OK;
 }
