@@ -159,4 +159,11 @@ static GDEFSTOR_Result m_rebuild(void * ctx, void * txn) {' \
   }
   /* Every row, through the transaction, from its truth alone. */'
 
+# The scan hands the reference engine the oldest revision, not the newest,
+# so who wrote it is who wrote the first.
+plant scan-hands-the-oldest-revision src/model.c testModel \
+  'ModelQuery.RevisionWhoIsTheNewestRevisionsAuthor' \
+  '      const MRev * nr = &e->revs[e->nrev - 1];' \
+  '      const MRev * nr = &e->revs[0];'
+
 plant_finish

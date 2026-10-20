@@ -1753,6 +1753,22 @@ static GDEFSTOR_Result m_scan(void * ctx, const char * type, size_t type_len,
     if (rc == GDEFSTOR_OK) {
       rc = visit_blinds(visitor, e, NULL, 0);
     }
+    if (rc == GDEFSTOR_OK && visitor->revision != NULL && e->nrev > 0) {
+      /* The newest revision, for a query that reads who wrote it. */
+      const MRev * nr = &e->revs[e->nrev - 1];
+      GDEFSTOR_ModelRevision rv;
+      memset(&rv, 0, sizeof rv);
+      rv.revision = nr->rev;
+      rv.commit_seq = nr->seq;
+      rv.who = nr->who;
+      rv.who_len = nr->who_len;
+      rv.when_ms = nr->when;
+      rv.why = nr->why;
+      rv.why_len = nr->why_len;
+      rv.languages = nr->langs;
+      rv.languages_len = nr->langs_len;
+      rc = visitor->revision(visitor->ctx, e->row, &rv);
+    }
     if (rc != GDEFSTOR_OK) {
       return rc;
     }
