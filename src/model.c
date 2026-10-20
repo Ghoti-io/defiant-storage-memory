@@ -2079,6 +2079,64 @@ static GDEFSTOR_Result m_blind_delete(void * ctx, void * txn,
   return GDEFSTOR_OK;
 }
 
+/* A blind row put back (gdefstor_blind_put()): the row of the same version
+ * and field, if there is one, gives way to it, so the entity keeps one row
+ * per version. */
+static GDEFSTOR_Result m_blind_put(void * ctx, void * txn,
+    const GDEFSTOR_Type * type, uint64_t row, const GDEFSTOR_ModelBlind * b) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MEnt * e;
+  MBlind * n;
+  size_t i;
+  size_t kept = 0;
+  GDEFSTOR_Result rc;
+  (void)type;
+  if (x == NULL || b == NULL || b->mac == NULL ||
+      (b->subject == NULL && b->subject_len != 0) || b->language_len == 0 ||
+      b->language_len > sizeof n->lang) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  e = ent_view(x->ten, x, row);
+  if (e == NULL || version_to(e, b->item, b->valid_from) == UINT64_MAX) {
+    return GDEFSTOR_ERR_INTERNAL; /* the port checked the version exists */
+  }
+  if (row <= x->ten->nent) {
+    rc = ent_touch(m, x, row, &e);
+    if (rc != GDEFSTOR_OK) {
+      return rc;
+    }
+  }
+  for (i = 0; i < e->nblind; i++) {
+    if (e->blinds[i].item == b->item && e->blinds[i].from == b->valid_from &&
+        e->blinds[i].field == b->field) {
+      gcu_allocator_free(m->alloc, e->blinds[i].subject);
+    } else {
+      e->blinds[kept++] = e->blinds[i];
+    }
+  }
+  e->nblind = kept;
+  GROW_OR_OOM(m->alloc, e->blinds, e->nblind, e->capblind);
+  n = &e->blinds[e->nblind];
+  memset(n, 0, sizeof *n);
+  n->subject = (uint8_t *)str_copy(m->alloc, (const char *)b->subject,
+      b->subject_len);
+  if (n->subject == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
+  n->item = b->item;
+  n->from = b->valid_from;
+  n->field = b->field;
+  n->subject_len = b->subject_len;
+  memcpy(n->mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
+  n->key_id = b->key_id;
+  n->version = b->version;
+  memcpy(n->lang, b->language, b->language_len);
+  n->lang_len = b->language_len;
+  e->nblind += 1;
+  return GDEFSTOR_OK;
+}
+
 /* ---- records, counters and the outbox ------------------------------------ */
 
 /* Byte order, a prefix first. */
@@ -2821,5 +2879,6 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->restore_revision = m_restore_revision;
   out->restore_counter = m_restore_counter;
   out->restore_outbox = m_restore_outbox;
+  out->blind_put = m_blind_put;
   return GDEFSTOR_OK;
 }

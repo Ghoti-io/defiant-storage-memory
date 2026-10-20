@@ -166,4 +166,13 @@ plant scan-hands-the-oldest-revision src/model.c testModel \
   '      const MRev * nr = &e->revs[e->nrev - 1];' \
   '      const MRev * nr = &e->revs[0];'
 
+# A blind row put back beside the row the version already has: a rebuild run
+# twice leaves two rows per version (story S6c).
+plant blind-put-keeps-the-old-row src/model.c testModel \
+  'ModelBlindPut.PuttingTheRowsBackRebuildsTheBlindIndex' \
+  '    if (e->blinds[i].item == b->item && e->blinds[i].from == b->valid_from &&
+        e->blinds[i].field == b->field) {' \
+  '    if (0 && e->blinds[i].item == b->item &&
+        e->blinds[i].from == b->valid_from && e->blinds[i].field == b->field) {'
+
 plant_finish
