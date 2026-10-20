@@ -132,6 +132,9 @@ typedef struct MVer {
   uint64_t to;
   GDEFSTOR_Value * vals;
   size_t nvals;
+  /* The language of its tree: a column of the row, held in place. */
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } MVer;
 
 static void ver_free(const GDEFSMEMORY_Allocator * a, MVer * v) {
@@ -176,6 +179,8 @@ typedef struct MRev {
   int64_t when;
   char * why;
   size_t why_len;
+  char * langs; /* the languages it changed, as the port gave them */
+  size_t langs_len;
 } MRev;
 
 typedef struct MSt {
@@ -197,6 +202,8 @@ typedef struct MBlind {
   uint8_t mac[GDEFSTOR_BLIND_MAC_BYTES];
   uint32_t key_id;
   uint32_t version;
+  char lang[GDEFSTOR_MODEL_MAX_LANGUAGE_BYTES];
+  size_t lang_len;
 } MBlind;
 
 typedef struct MEnt {
@@ -237,6 +244,7 @@ static void ent_free(const GDEFSMEMORY_Allocator * a, MEnt * e) {
   for (i = 0; i < e->nrev; i++) {
     gcu_allocator_free(a, e->revs[i].who);
     gcu_allocator_free(a, e->revs[i].why);
+    gcu_allocator_free(a, e->revs[i].langs);
   }
   for (i = 0; i < e->nst; i++) {
     gcu_allocator_free(a, e->sts[i].actor);
@@ -295,8 +303,10 @@ static GDEFSTOR_Result ent_copy(const GDEFSMEMORY_Allocator * a,
       c->revs[i] = e->revs[i];
       c->revs[i].who = str_copy(a, e->revs[i].who, e->revs[i].who_len);
       c->revs[i].why = str_copy(a, e->revs[i].why, e->revs[i].why_len);
+      c->revs[i].langs = str_copy(a, e->revs[i].langs, e->revs[i].langs_len);
       c->nrev = i + 1;
-      if (c->revs[i].who == NULL || c->revs[i].why == NULL) {
+      if (c->revs[i].who == NULL || c->revs[i].why == NULL ||
+          c->revs[i].langs == NULL) {
         ent_free(a, c);
         return GDEFSTOR_ERR_OOM;
       }
@@ -1283,16 +1293,27 @@ static GDEFSTOR_Result visit_ver(const GDEFSTOR_ModelVisitor * v, uint64_t row,
   i.valid_to = x->to;
   i.values = x->vals;
   i.value_count = x->nvals;
+  i.language = x->lang;
+  i.language_len = x->lang_len;
   return v->item(v->ctx, row, &i);
 }
 
+/* @p lang_len 0: every language. */
+static int in_lang(const char * have, size_t have_len, const char * lang,
+    size_t lang_len) {
+  return lang_len == 0 || same(have, have_len, lang, lang_len);
+}
+
 static GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v,
-    const MEnt * e) {
+    const MEnt * e, const char * lang, size_t lang_len) {
   size_t i;
   for (i = 0; v->blind != NULL && i < e->nblind; i++) {
     const MBlind * x = &e->blinds[i];
     GDEFSTOR_ModelBlind b;
     GDEFSTOR_Result rc;
+    if (!in_lang(x->lang, x->lang_len, lang, lang_len)) {
+      continue;
+    }
     memset(&b, 0, sizeof b);
     b.item = x->item;
     b.valid_from = x->from;
@@ -1302,6 +1323,8 @@ static GDEFSTOR_Result visit_blinds(const GDEFSTOR_ModelVisitor * v,
     b.mac = x->mac;
     b.key_id = x->key_id;
     b.version = x->version;
+    b.language = x->lang;
+    b.language_len = x->lang_len;
     rc = v->blind(v->ctx, e->row, &b);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1393,10 +1416,11 @@ static GDEFSTOR_Result m_state_append(void * ctx, void * txn, uint64_t row,
 
 /* Take an item version out of the current table. */
 static void cur_remove(const GDEFSMEMORY_Allocator * a, MEnt * e,
-    uint32_t group, uint64_t item) {
+    uint32_t group, uint64_t item, const char * lang, size_t lang_len) {
   size_t i;
   for (i = 0; i < e->ncur; i++) {
-    if (e->cur[i].group == group && e->cur[i].item == item) {
+    if (e->cur[i].group == group && e->cur[i].item == item &&
+        same(e->cur[i].lang, e->cur[i].lang_len, lang, lang_len)) {
       ver_free(a, &e->cur[i]);
       memmove(&e->cur[i], &e->cur[i + 1], (e->ncur - i - 1) * sizeof *e->cur);
       e->ncur -= 1;
@@ -1431,7 +1455,8 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
     for (k = 0; k < e->nver; k++) {
       MVer * v = &e->vers[k];
       if (v->group == c->group && v->item == c->item &&
-          v->from == c->valid_from) {
+          v->from == c->valid_from &&
+          same(v->lang, v->lang_len, c->language, c->language_len)) {
         /* valid_to is written once. */
         if (v->to != 0) {
           return GDEFSTOR_ERR_INTERNAL;
@@ -1443,7 +1468,7 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
     if (!found) {
       return GDEFSTOR_ERR_INTERNAL;
     }
-    cur_remove(m->alloc, e, c->group, c->item);
+    cur_remove(m->alloc, e, c->group, c->item, c->language, c->language_len);
   }
   for (i = 0; i < a->insert_count; i++) {
     const GDEFSTOR_ModelItem * in = &a->inserts[i];
@@ -1457,6 +1482,11 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
     n.to = 0;
     n.vals = (GDEFSTOR_Value *)in->values;
     n.nvals = in->value_count;
+    if (in->language_len == 0 || in->language_len > sizeof n.lang) {
+      return GDEFSTOR_ERR_INTERNAL;
+    }
+    memcpy(n.lang, in->language, in->language_len);
+    n.lang_len = in->language_len;
     GROW_OR_OOM(m->alloc, e->vers, e->nver, e->capver);
     GROW_OR_OOM(m->alloc, e->cur, e->ncur, e->capcur);
     rc = ver_set(m->alloc, &e->vers[e->nver], &n);
@@ -1480,7 +1510,8 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
       indexed |= a->inserts[k].item == b->item;
     }
     if (!indexed || b->valid_from != rev || b->mac == NULL ||
-        (b->subject == NULL && b->subject_len != 0)) {
+        (b->subject == NULL && b->subject_len != 0) ||
+        b->language_len == 0 || b->language_len > sizeof n->lang) {
       return GDEFSTOR_ERR_INTERNAL;
     }
     GROW_OR_OOM(m->alloc, e->blinds, e->nblind, e->capblind);
@@ -1498,6 +1529,8 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
     memcpy(n->mac, b->mac, GDEFSTOR_BLIND_MAC_BYTES);
     n->key_id = b->key_id;
     n->version = b->version;
+    memcpy(n->lang, b->language, b->language_len);
+    n->lang_len = b->language_len;
     e->nblind += 1;
   }
   GROW_OR_OOM(m->alloc, e->revs, e->nrev, e->caprev);
@@ -1508,11 +1541,15 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
   memset(r, 0, sizeof *r);
   r->who = str_copy(m->alloc, a->revision->who, a->revision->who_len);
   r->why = str_copy(m->alloc, a->revision->why, a->revision->why_len);
-  if (r->who == NULL || r->why == NULL) {
+  r->langs = str_copy(m->alloc, a->revision->languages,
+      a->revision->languages_len);
+  if (r->who == NULL || r->why == NULL || r->langs == NULL) {
     gcu_allocator_free(m->alloc, r->who);
     gcu_allocator_free(m->alloc, r->why);
+    gcu_allocator_free(m->alloc, r->langs);
     return GDEFSTOR_ERR_OOM;
   }
+  r->langs_len = a->revision->languages_len;
   r->rev = rev;
   r->seq = x->seq;
   r->who_len = a->revision->who_len;
@@ -1538,6 +1575,8 @@ static GDEFSTOR_Result visit_history(const MEnt * e,
     r.when_ms = e->revs[i].when;
     r.why = e->revs[i].why;
     r.why_len = e->revs[i].why_len;
+    r.languages = e->revs[i].langs;
+    r.languages_len = e->revs[i].langs_len;
     rc = v->revision(v->ctx, e->row, &r);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1573,6 +1612,44 @@ static GDEFSTOR_Result m_history(void * ctx, void * txn, const char * tenant,
 }
 
 static GDEFSTOR_Result m_items(void * ctx, void * txn, const char * tenant,
+    size_t tenant_len, uint64_t row, uint64_t as_of, const char * lang,
+    size_t lang_len, const GDEFSTOR_ModelVisitor * visitor) {
+  MModel * m = (MModel *)ctx;
+  MTxn * x = (MTxn *)txn;
+  MEnt * e = ent_view(view_tenant(m, x, tenant, tenant_len), x, row);
+  size_t i;
+  if (e == NULL) {
+    return GDEFSTOR_ERR_INVALID;
+  }
+  if (as_of == 0) {
+    for (i = 0; i < e->ncur; i++) {
+      GDEFSTOR_Result rc;
+      if (!in_lang(e->cur[i].lang, e->cur[i].lang_len, lang, lang_len)) {
+        continue;
+      }
+      rc = visit_ver(visitor, row, &e->cur[i]);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+    return visit_blinds(visitor, e, lang, lang_len);
+  }
+  for (i = 0; i < e->nver; i++) {
+    const MVer * v = &e->vers[i];
+    if (v->from <= as_of && (v->to == 0 || v->to > as_of) &&
+        in_lang(v->lang, v->lang_len, lang, lang_len)) {
+      GDEFSTOR_Result rc = visit_ver(visitor, row, v);
+      if (rc != GDEFSTOR_OK) {
+        return rc;
+      }
+    }
+  }
+  return visit_blinds(visitor, e, lang, lang_len);
+}
+
+/* The languages of the entity's trees: one per root item (group 0), current
+ * or valid at @p as_of. */
+static GDEFSTOR_Result m_languages(void * ctx, void * txn, const char * tenant,
     size_t tenant_len, uint64_t row, uint64_t as_of,
     const GDEFSTOR_ModelVisitor * visitor) {
   MModel * m = (MModel *)ctx;
@@ -1584,23 +1661,29 @@ static GDEFSTOR_Result m_items(void * ctx, void * txn, const char * tenant,
   }
   if (as_of == 0) {
     for (i = 0; i < e->ncur; i++) {
-      GDEFSTOR_Result rc = visit_ver(visitor, row, &e->cur[i]);
+      GDEFSTOR_Result rc;
+      if (e->cur[i].group != 0) {
+        continue;
+      }
+      rc = visitor->language(visitor->ctx, row, e->cur[i].lang,
+          e->cur[i].lang_len);
       if (rc != GDEFSTOR_OK) {
         return rc;
       }
     }
-    return visit_blinds(visitor, e);
+    return GDEFSTOR_OK;
   }
   for (i = 0; i < e->nver; i++) {
     const MVer * v = &e->vers[i];
-    if (v->from <= as_of && (v->to == 0 || v->to > as_of)) {
-      GDEFSTOR_Result rc = visit_ver(visitor, row, v);
+    if (v->group == 0 && v->from <= as_of && (v->to == 0 || v->to > as_of)) {
+      GDEFSTOR_Result rc = visitor->language(visitor->ctx, row, v->lang,
+          v->lang_len);
       if (rc != GDEFSTOR_OK) {
         return rc;
       }
     }
   }
-  return visit_blinds(visitor, e);
+  return GDEFSTOR_OK;
 }
 
 /* ---- queries, rebuild, dump ---------------------------------------------- */
@@ -1630,7 +1713,7 @@ static GDEFSTOR_Result m_scan(void * ctx, const char * type, size_t type_len,
       rc = visit_ver(visitor, e->row, &e->cur[i]);
     }
     if (rc == GDEFSTOR_OK) {
-      rc = visit_blinds(visitor, e);
+      rc = visit_blinds(visitor, e, NULL, 0);
     }
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1728,7 +1811,7 @@ static GDEFSTOR_Result m_dump(void * ctx, const char * tenant,
         rc = visit_ver(visitor, e->row, &e->vers[k]);
       }
       if (rc == GDEFSTOR_OK) {
-        rc = visit_blinds(visitor, e);
+        rc = visit_blinds(visitor, e, NULL, 0);
       }
     } else {
       for (k = 0; rc == GDEFSTOR_OK && k < e->ncur; k++) {
@@ -1833,6 +1916,8 @@ static GDEFSTOR_Result m_blind_history(void * ctx, const char * tenant,
       h.subject_len = b->subject_len;
       h.key_id = b->key_id;
       h.version = b->version;
+      h.language = b->lang;
+      h.language_len = b->lang_len;
       rc = fn(fn_ctx, &h);
       if (rc != GDEFSTOR_OK) {
         return rc;
@@ -1879,6 +1964,8 @@ static GDEFSTOR_Result m_subject_lookup(void * ctx, const char * tenant,
         h.item = v->item;
         h.valid_from = v->from;
         h.valid_to = v->to;
+        h.language = v->lang;
+        h.language_len = v->lang_len;
         rc = fn(fn_ctx, &h);
         if (rc != GDEFSTOR_OK) {
           return rc;
@@ -2620,5 +2707,7 @@ GDEFSTOR_Result gdefsmemory_model_backend(const GDEFSMEMORY_Allocator * alloc,
   out->outbox_delete = m_outbox_delete;
   out->outbox_fail = m_outbox_fail;
   out->outbox_parked = m_outbox_parked;
+  out->lang_ctx = m;
+  out->languages = m_languages;
   return GDEFSTOR_OK;
 }

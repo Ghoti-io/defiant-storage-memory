@@ -25,7 +25,8 @@ plant_control testModel 'Model*'
 plant valid-to-twice src/model.c testModel \
   'ModelHistory.ValidToIsWrittenOnce ModelSweep.RandomHistoriesMatchAnIndependentModel' \
   '      if (v->group == c->group && v->item == c->item &&
-          v->from == c->valid_from) {
+          v->from == c->valid_from &&
+          same(v->lang, v->lang_len, c->language, c->language_len)) {
         /* valid_to is written once. */
         if (v->to != 0) {
           return GDEFSTOR_ERR_INTERNAL;
@@ -78,9 +79,9 @@ plant revert-updates-old-rows src/model.c testModel \
 # matches what a rebuild from the truth gives.
 plant current-diverges src/model.c testModel \
   'ModelDerived.RebuildGivesTheSameCurrentState ModelSweep.RandomHistoriesMatchAnIndependentModel' \
-  '    cur_remove(m->alloc, e, c->group, c->item);' \
+  '    cur_remove(m->alloc, e, c->group, c->item, c->language, c->language_len);' \
   '    if (c->group == 0) {
-      cur_remove(m->alloc, e, c->group, c->item);
+      cur_remove(m->alloc, e, c->group, c->item, c->language, c->language_len);
     }'
 
 # Records, counters and the outbox (story S6a) --------------------------------
