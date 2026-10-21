@@ -25,8 +25,8 @@
  *
  * The returned store is the port's. Close it with gdefstor_store_destroy().
  * Isolation, the writer queue and the formats stay in the port; this library
- * only keeps the committed bytes and, for the entity port (model.h), the
- * committed rows. It also has a key store (keystore.h) for tests.
+ * only keeps the committed rows of the entity port (model.h). It also has a
+ * key store (keystore.h) for tests.
  */
 
 #ifndef GHOTI_IO_GDEFSMEMORY_MEMORY_H
