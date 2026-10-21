@@ -19,7 +19,10 @@ outbox on first touch, and writes each counter's floor into the committed
 tenant at once, so a value an aborted write took is never taken again. It
 has the restore members a snapshot import writes through (story S6a3): a
 revision that keeps its commit sequence, a counter set to its value, an
-outbox row with its lease, failures and parked flag.
+outbox row with its lease, failures and parked flag. It also keeps the blind
+index (blind rows beside the versions they index, the history and subject
+lookups, deletion by subject and putting a row back) and lists an entity's
+languages from its root items.
 `gdefsmemory_keystore_create`
 opens a key store (`defiant-storage/keystore.h`) over a cipher the caller
 supplies; it keeps keys in the process, which makes it for tests only.
@@ -36,4 +39,6 @@ a backend can make on its own (a `valid_to` written twice, a revert that
 reopens old rows, a current table that drifts from the truth, a record written
 outside its transaction, a counter that reuses an aborted value, an outbox
 claim out of order or under another live lease, a parked row deleted, records
-cleared by a rebuild) and requires a named test to fail for each.
+cleared by a rebuild, a scan handed the oldest revision instead of the newest,
+a blind row put back beside the one it replaces) and requires a named test to
+fail for each.
