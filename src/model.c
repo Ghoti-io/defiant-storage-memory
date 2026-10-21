@@ -181,6 +181,8 @@ typedef struct MRev {
   size_t why_len;
   char * langs; /* the languages it changed, as the port gave them */
   size_t langs_len;
+  char * schema; /* its schema stamp, as the port gave it */
+  size_t schema_len;
 } MRev;
 
 typedef struct MSt {
@@ -245,6 +247,7 @@ static void ent_free(const GDEFSMEMORY_Allocator * a, MEnt * e) {
     gcu_allocator_free(a, e->revs[i].who);
     gcu_allocator_free(a, e->revs[i].why);
     gcu_allocator_free(a, e->revs[i].langs);
+    gcu_allocator_free(a, e->revs[i].schema);
   }
   for (i = 0; i < e->nst; i++) {
     gcu_allocator_free(a, e->sts[i].actor);
@@ -304,9 +307,11 @@ static GDEFSTOR_Result ent_copy(const GDEFSMEMORY_Allocator * a,
       c->revs[i].who = str_copy(a, e->revs[i].who, e->revs[i].who_len);
       c->revs[i].why = str_copy(a, e->revs[i].why, e->revs[i].why_len);
       c->revs[i].langs = str_copy(a, e->revs[i].langs, e->revs[i].langs_len);
+      c->revs[i].schema = str_copy(a, e->revs[i].schema,
+          e->revs[i].schema_len);
       c->nrev = i + 1;
       if (c->revs[i].who == NULL || c->revs[i].why == NULL ||
-          c->revs[i].langs == NULL) {
+          c->revs[i].langs == NULL || c->revs[i].schema == NULL) {
         ent_free(a, c);
         return GDEFSTOR_ERR_OOM;
       }
@@ -439,6 +444,8 @@ typedef struct MDraft {
   uint64_t base;
   uint8_t * json;
   size_t json_len;
+  char * schema;
+  size_t schema_len;
 } MDraft;
 
 /* A record: committed (in the tenant, sorted by namespace then key), or a
@@ -450,6 +457,8 @@ typedef struct MRec {
   size_t key_len;
   uint8_t * bytes;
   size_t len;
+  char * schema;
+  size_t schema_len;
   int dead;
 } MRec;
 
@@ -563,6 +572,7 @@ static void drafts_free(const GDEFSMEMORY_Allocator * a, MDraft * v, size_t n) {
     gcu_allocator_free(a, v[i].pid);
     gcu_allocator_free(a, v[i].type);
     gcu_allocator_free(a, v[i].json);
+    gcu_allocator_free(a, v[i].schema);
   }
   gcu_allocator_free(a, v);
 }
@@ -612,7 +622,9 @@ static GDEFSTOR_Result drafts_copy(const GDEFSMEMORY_Allocator * a,
     v[i].type = str_copy(a, src[i].type, src[i].type_len);
     v[i].json = (uint8_t *)str_copy(a, (const char *)src[i].json,
         src[i].json_len);
-    if (v[i].pid == NULL || v[i].type == NULL || v[i].json == NULL) {
+    v[i].schema = str_copy(a, src[i].schema, src[i].schema_len);
+    if (v[i].pid == NULL || v[i].type == NULL || v[i].json == NULL ||
+        v[i].schema == NULL) {
       drafts_free(a, v, i + 1);
       return GDEFSTOR_ERR_OOM;
     }
@@ -705,6 +717,7 @@ static void rec_free(const GDEFSMEMORY_Allocator * a, MRec * r) {
   gcu_allocator_free(a, r->ns);
   gcu_allocator_free(a, r->key);
   gcu_allocator_free(a, r->bytes);
+  gcu_allocator_free(a, r->schema);
   memset(r, 0, sizeof *r);
 }
 
@@ -1181,12 +1194,15 @@ static GDEFSTOR_Result m_draft_put(void * ctx, void * txn,
   n.pid = str_copy(m->alloc, d->public_id, d->public_id_len);
   n.type = str_copy(m->alloc, d->type, d->type_len);
   n.json = (uint8_t *)str_copy(m->alloc, (const char *)d->json, d->json_len);
-  if (n.pid == NULL || n.type == NULL || n.json == NULL) {
+  n.schema = str_copy(m->alloc, d->schema, d->schema_len);
+  if (n.pid == NULL || n.type == NULL || n.json == NULL || n.schema == NULL) {
     gcu_allocator_free(m->alloc, n.pid);
     gcu_allocator_free(m->alloc, n.type);
     gcu_allocator_free(m->alloc, n.json);
+    gcu_allocator_free(m->alloc, n.schema);
     return GDEFSTOR_ERR_OOM;
   }
+  n.schema_len = d->schema_len;
   n.pid_len = d->public_id_len;
   n.type_len = d->type_len;
   n.json_len = d->json_len;
@@ -1196,6 +1212,7 @@ static GDEFSTOR_Result m_draft_put(void * ctx, void * txn,
       gcu_allocator_free(m->alloc, x->drafts[i].pid);
       gcu_allocator_free(m->alloc, x->drafts[i].type);
       gcu_allocator_free(m->alloc, x->drafts[i].json);
+      gcu_allocator_free(m->alloc, x->drafts[i].schema);
       x->drafts[i] = n;
       return GDEFSTOR_OK;
     }
@@ -1207,6 +1224,7 @@ static GDEFSTOR_Result m_draft_put(void * ctx, void * txn,
       gcu_allocator_free(m->alloc, n.pid);
       gcu_allocator_free(m->alloc, n.type);
       gcu_allocator_free(m->alloc, n.json);
+      gcu_allocator_free(m->alloc, n.schema);
       return GDEFSTOR_ERR_OOM;
     }
     x->drafts = more;
@@ -1225,6 +1243,8 @@ static void lend_draft(const MDraft * d, GDEFSTOR_ModelDraft * out) {
   out->base_revision = d->base;
   out->json = d->json;
   out->json_len = d->json_len;
+  out->schema = d->schema;
+  out->schema_len = d->schema_len;
 }
 
 static GDEFSTOR_Result m_draft_get(void * ctx, void * txn, const char * tenant,
@@ -1260,6 +1280,7 @@ static GDEFSTOR_Result m_draft_delete(void * ctx, void * txn,
       gcu_allocator_free(m->alloc, x->drafts[i].pid);
       gcu_allocator_free(m->alloc, x->drafts[i].type);
       gcu_allocator_free(m->alloc, x->drafts[i].json);
+      gcu_allocator_free(m->alloc, x->drafts[i].schema);
       memmove(&x->drafts[i], &x->drafts[i + 1],
           (x->ndraft - i - 1) * sizeof *x->drafts);
       x->ndraft -= 1;
@@ -1551,12 +1572,18 @@ static GDEFSTOR_Result m_apply(void * ctx, void * txn,
   r->why = str_copy(m->alloc, a->revision->why, a->revision->why_len);
   r->langs = str_copy(m->alloc, a->revision->languages,
       a->revision->languages_len);
-  if (r->who == NULL || r->why == NULL || r->langs == NULL) {
+  r->schema = str_copy(m->alloc, a->revision->schema,
+      a->revision->schema_len);
+  if (r->who == NULL || r->why == NULL || r->langs == NULL ||
+      r->schema == NULL) {
     gcu_allocator_free(m->alloc, r->who);
     gcu_allocator_free(m->alloc, r->why);
     gcu_allocator_free(m->alloc, r->langs);
+    gcu_allocator_free(m->alloc, r->schema);
+    memset(r, 0, sizeof *r);
     return GDEFSTOR_ERR_OOM;
   }
+  r->schema_len = a->revision->schema_len;
   r->langs_len = a->revision->languages_len;
   r->rev = rev;
   r->seq = x->seq;
@@ -1615,6 +1642,8 @@ static GDEFSTOR_Result visit_history(const MEnt * e,
     r.why_len = e->revs[i].why_len;
     r.languages = e->revs[i].langs;
     r.languages_len = e->revs[i].langs_len;
+    r.schema = e->revs[i].schema;
+    r.schema_len = e->revs[i].schema_len;
     rc = v->revision(v->ctx, e->row, &r);
     if (rc != GDEFSTOR_OK) {
       return rc;
@@ -1767,6 +1796,8 @@ static GDEFSTOR_Result m_scan(void * ctx, const char * type, size_t type_len,
       rv.why_len = nr->why_len;
       rv.languages = nr->langs;
       rv.languages_len = nr->langs_len;
+      rv.schema = nr->schema;
+      rv.schema_len = nr->schema_len;
       rc = visitor->revision(visitor->ctx, e->row, &rv);
     }
     if (rc != GDEFSTOR_OK) {
@@ -2193,7 +2224,7 @@ static MRec * rput_find(MTxn * x, const char * ns, size_t ns_len,
 /* A new entry of the transaction's records for (ns, key), taking @p bytes. */
 static GDEFSTOR_Result rput_add(MModel * m, MTxn * x, const char * ns,
     size_t ns_len, const char * key, size_t key_len, uint8_t * bytes,
-    size_t len, int dead) {
+    size_t len, char * schema, size_t schema_len, int dead) {
   MRec n;
   void * more = grown(m->alloc, x->rput, x->nrput, &x->caprput,
       sizeof *x->rput);
@@ -2207,8 +2238,11 @@ static GDEFSTOR_Result rput_add(MModel * m, MTxn * x, const char * ns,
     gcu_allocator_free(m->alloc, n.ns);
     gcu_allocator_free(m->alloc, n.key);
     gcu_allocator_free(m->alloc, bytes);
+    gcu_allocator_free(m->alloc, schema);
     return GDEFSTOR_ERR_OOM;
   }
+  n.schema = schema;
+  n.schema_len = schema_len;
   n.ns_len = ns_len;
   n.key_len = key_len;
   n.bytes = bytes;
@@ -2224,13 +2258,19 @@ static GDEFSTOR_Result m_record_put(void * ctx, void * txn,
   MModel * m = (MModel *)ctx;
   MTxn * x = (MTxn *)txn;
   uint8_t * bytes = NULL;
+  char * schema = NULL;
   MRec * o;
   if (x == NULL || r == NULL || (r->bytes == NULL && r->len != 0)) {
     return GDEFSTOR_ERR_INVALID;
   }
+  schema = str_copy(m->alloc, r->schema, r->schema_len);
+  if (schema == NULL) {
+    return GDEFSTOR_ERR_OOM;
+  }
   if (r->len > 0) {
     bytes = (uint8_t *)gcu_allocator_malloc(m->alloc, r->len);
     if (bytes == NULL) {
+      gcu_allocator_free(m->alloc, schema);
       return GDEFSTOR_ERR_OOM;
     }
     memcpy(bytes, r->bytes, r->len);
@@ -2239,13 +2279,16 @@ static GDEFSTOR_Result m_record_put(void * ctx, void * txn,
   o = rput_find(x, r->ns, r->ns_len, r->key, r->key_len);
   if (o != NULL) {
     gcu_allocator_free(m->alloc, o->bytes);
+    gcu_allocator_free(m->alloc, o->schema);
     o->bytes = bytes;
     o->len = r->len;
+    o->schema = schema;
+    o->schema_len = r->schema_len;
     o->dead = 0;
     return GDEFSTOR_OK;
   }
   return rput_add(m, x, r->ns, r->ns_len, r->key, r->key_len, bytes, r->len,
-      0);
+      schema, r->schema_len, 0);
 }
 
 static GDEFSTOR_Result m_record_delete(void * ctx, void * txn, const char * ns,
@@ -2262,8 +2305,11 @@ static GDEFSTOR_Result m_record_delete(void * ctx, void * txn, const char * ns,
   if (o != NULL) {
     *out_deleted = !o->dead;
     gcu_allocator_free(m->alloc, o->bytes);
+    gcu_allocator_free(m->alloc, o->schema);
     o->bytes = NULL;
     o->len = 0;
+    o->schema = NULL;
+    o->schema_len = 0;
     o->dead = 1;
     return GDEFSTOR_OK;
   }
@@ -2272,7 +2318,7 @@ static GDEFSTOR_Result m_record_delete(void * ctx, void * txn, const char * ns,
     *out_deleted = 0;
     return GDEFSTOR_OK;
   }
-  rc = rput_add(m, x, ns, ns_len, key, key_len, NULL, 0, 1);
+  rc = rput_add(m, x, ns, ns_len, key, key_len, NULL, 0, NULL, 0, 1);
   if (rc == GDEFSTOR_OK) {
     *out_deleted = 1;
   }
@@ -2289,6 +2335,8 @@ static GDEFSTOR_Result visit_record(const GDEFSTOR_ModelVisitor * v,
   out.key_len = r->key_len;
   out.bytes = r->bytes;
   out.len = r->len;
+  out.schema = r->schema;
+  out.schema_len = r->schema_len;
   return v->record(v->ctx, &out);
 }
 
@@ -2774,9 +2822,13 @@ static void sys_apply(const GDEFSMEMORY_Allocator * a, MTen * t, MTxn * x) {
       rec_free(a, o);
     } else if (found) {
       gcu_allocator_free(a, t->recs[at].bytes);
+      gcu_allocator_free(a, t->recs[at].schema);
       t->recs[at].bytes = o->bytes;
       t->recs[at].len = o->len;
+      t->recs[at].schema = o->schema;
+      t->recs[at].schema_len = o->schema_len;
       o->bytes = NULL;
+      o->schema = NULL;
       rec_free(a, o);
     } else {
       memmove(&t->recs[at + 1], &t->recs[at], (t->nrec - at) * sizeof *t->recs);

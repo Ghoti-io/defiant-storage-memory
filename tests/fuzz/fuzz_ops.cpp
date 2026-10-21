@@ -76,6 +76,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     meta.who = "";
     meta.when_ms = 1;
     meta.why = "";
+    meta.schema = "fuzz/1";
+    meta.schema_len = 6;
     if (gdefstor_entity_create(write, "f.t", 3, "e", 1, "", 0, 1, NULL) ==
         GDEFSTOR_OK) {
       gdefstor_entity_save(write, "e", 1, 0, &meta, "en", 2, tree, NULL);
