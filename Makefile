@@ -835,8 +835,17 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 check-defects: ## Fail unless each planted defect turns the conformance gate red
 	@tools/check-defects.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) TEXT_PC=$(TEXT_PC) ARCHIVE_PC=$(ARCHIVE_PC)
 
+# The paths this Makefile bakes into objects, handed to the copy a plant builds
+# in, so the copy compiles with the same flags as this tree and keeps its
+# objects (plant-lib.sh). Left to default they would name the copy's own
+# directory, the flags stamp would differ, and every plant would recompile the
+# library. The helpers are defiant-storage's, installed with its conformance
+# suites.
+PLANT_PATHS = TEST_DATA=$(TEST_DATA)
+PLANT_LIB = $(STOR_CONFORMANCE)/plant-lib.sh
+
 check-model: ## Fail unless each defect planted in the entity backend turns a named test red
-	@tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) STOR_PC=$(STOR_PC)
+	@GHOTI_PLANT_LIB=$(PLANT_LIB) tools/check-model.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) STOR_PC=$(STOR_PC) $(PLANT_PATHS)
 
 check-symbols: ## Fail if any exported symbol lacks the version namespace
 check-symbols: $(APP_DIR)/$(TARGET)
@@ -908,6 +917,11 @@ ifeq ($(OS_NAME), Linux)
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
+
+# A gate copies the finished build into its scratch tree (plant-lib.sh), so
+# under make -j no gate may start before the library and every test
+# executable are linked.
+$(TEST_GATES): | $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES)
 
 test: ## Make and run the unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)

@@ -16,7 +16,15 @@ MAKE="${1:?usage: check-model.sh <make> <build-dir> [make args]}"
 BUILD_DIR="${2:?usage: check-model.sh <make> <build-dir> [make args]}"
 shift 2
 
-. tools/plant-lib.sh
+# The helpers are defiant-storage's, installed with its conformance suites;
+# the Makefile names the file.
+PLANT_LIB="${GHOTI_PLANT_LIB:-}"
+if [ ! -r "$PLANT_LIB" ]; then
+  printf '%s: defiant-storage installs the plant helpers (plant-lib.sh) with its conformance suites and none was found at "%s": install defiant-storage first, then run this through make (GHOTI_PLANT_LIB names the file)\n' \
+    "$(basename "$0")" "$PLANT_LIB" >&2
+  exit 1
+fi
+. "$PLANT_LIB"
 plant_setup "$MAKE" "$BUILD_DIR" "$@"
 plant_control testModel 'Model*'
 
@@ -174,5 +182,15 @@ plant blind-put-keeps-the-old-row src/model.c testModel \
         e->blinds[i].field == b->field) {' \
   '    if (0 && e->blinds[i].item == b->item &&
         e->blinds[i].from == b->valid_from && e->blinds[i].field == b->field) {'
+
+# The stale-object plant. A plant's copy starts from the finished build, so the
+# edit has to be compiled into it; this one is made not to be (the object that
+# depends on the edit is left looking up to date), and the gate has to refuse it
+# as a STALE OBJECT. If it ever passes instead, a warm copy could pass with the
+# defect never built in.
+plant_stale stale-object src/model.c testModel \
+  'ModelQuery.RevisionWhoIsTheNewestRevisionsAuthor' \
+  '      const MRev * nr = &e->revs[e->nrev - 1];' \
+  '      const MRev * nr = &e->revs[0];'
 
 plant_finish
